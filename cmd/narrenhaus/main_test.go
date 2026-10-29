@@ -1166,6 +1166,53 @@ func TestServeUploadsAndServes(t *testing.T) {
 	}
 }
 
+// What the design calls success, with two serves that share nothing but
+// the server and the prefix: what one is given, the other serves, under
+// its own key. The package e2e has this and more with two instances put
+// together by hand; a build of the flake does not run that package, and
+// runs this.
+func TestUploadToOneServeFetchFromTheOther(t *testing.T) {
+	clearEnvironment(t)
+	noNix(t)
+	srv := testserver.Start(t, testserver.Options{})
+	optsA, optsB := testOptions(t, t.TempDir()), testOptions(t, t.TempDir())
+	a := startServe(t, optsA, hostOf(srv, time.Second))
+	b := startServe(t, optsB, hostOf(srv, time.Second))
+	p := newTestPath(t, "from one machine to the next\n")
+
+	b.want(http.StatusNotFound, http.MethodGet, "/"+p.hash+".narinfo", nil)
+	a.want(http.StatusOK, http.MethodPut, "/nar/"+p.narHash+".nar", p.archive)
+	a.want(http.StatusOK, http.MethodPut, "/"+p.hash+".narinfo", p.narinfo)
+
+	info, err := narinfo.Parse(b.want(http.StatusOK, http.MethodGet, "/"+p.hash+".narinfo", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyA, err := narinfo.LoadOrCreateSigningKey(filepath.Join(optsA.ConfigDir, "signing.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyB, err := narinfo.LoadOrCreateSigningKey(filepath.Join(optsB.ConfigDir, "signing.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keyA.Public() == keyB.Public() {
+		t.Fatal("the two serves have one signing key")
+	}
+	if want := keyB.Sign(info.Fingerprint()); !slices.Equal(info.Sigs, []string{want}) {
+		t.Errorf("the narinfo b serves is signed %q, want b's signature alone, %q", info.Sigs, want)
+	}
+	if info.StorePath != "/nix/store/"+p.hash+"-hello" || info.URL != "nar/"+p.narHash+".nar" || info.Compression != "none" {
+		t.Errorf("the narinfo b serves is of %s and names the NAR as %q with compression %q", info.StorePath, info.URL, info.Compression)
+	}
+	if got := b.want(http.StatusOK, http.MethodGet, "/"+info.URL, nil); !bytes.Equal(got, p.archive) {
+		t.Errorf("the NAR b serves is not the one a was sent")
+	}
+	if a.logged("NAR served") != 0 || b.logged("NAR served") != 1 {
+		t.Errorf("the logs do not say that b served one NAR and a none:\n%s\n%s", a.log.String(), b.log.String())
+	}
+}
+
 // uploading waits until the daemon whose cache directory is cache has
 // begun to stage an upload, which is when the upload's request has reached
 // the handler.

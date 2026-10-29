@@ -244,7 +244,9 @@ The repository is a flake; `nix build` makes the command with
 tests of the packages the command is made of. It does not run the tests of
 `e2e`: that package is test files alone, the command does not contain it,
 and gonixgo tests what the command contains. `go test ./e2e/` in the dev
-shell runs them, as `go test ./...` does. Evaluating a gonixgo package runs
+shell runs them, as `go test ./...` does; of the cases with two instances
+the build runs the one in `cmd/narrenhaus`, an upload to one `serve` that
+another serves. Evaluating a gonixgo package runs
 a program during evaluation, so every Nix command that touches the package
 needs one option:
 
