@@ -1,6 +1,6 @@
 # narrenhaus: design
 
-Date: 2026-10-29. Status: draft, waiting for the owner's approval. Checked
+Date: 2026-10-29. Status: complete, waiting for the owner's approval. Checked
 against jaccard-store v0.7.0, Amber-Store Core v0.10.0 and Nix 2.26.1 and
 2.35.4 (the owner's machine runs 2.35.4).
 
@@ -59,6 +59,9 @@ configuration says exactly what to add and where.
 - **Go**, CLI on **`urfave/cli/v2`**, **no `internal/` packages**.
 - The project is a **flake whose dev shell builds narrenhaus**, built with
   **[gonixgo](https://github.com/draganm/gonixgo)**.
+- The setup advice includes **`fallback = true`**, so that a narrenhaus
+  that is not running does not fail Nix operations. The owner chose this
+  over announcing a priority before cache.nixos.org (section 8.1).
 
 ### 2.2 Made in design, accepted by the owner in conversation
 
@@ -164,12 +167,6 @@ Each is the designer's call and may be overruled.
 16. For a user the Nix daemon does not trust, the check reads the system
     configuration alone, since that is all the daemon honours (section 8).
 17. The store directory is `/nix/store`; a narinfo for another is refused.
-
-### 2.4 Open: one question for the owner
-
-A configured narrenhaus that is not running fails Nix operations
-(section 8.1). The setup advice has to deal with that one way or another;
-which way is the owner's choice.
 
 ## 3. Goals, non-goals, anti-goals
 
@@ -618,7 +615,9 @@ Run at the start of `serve` (which then serves regardless) and by `check`
      no entry with the same name and another key comes before it (Nix keeps
      only the first key of a name; if one does, print it and say it must be
      removed);
-   - what section 8.1 settles.
+   - `fallback` is `true` (section 8.1). This one is read from the user's
+     full view for every user, trusted or not, because the daemon always
+     honours it from the client.
 3. Configured: one line saying so. Where that rests on a file under
    `/etc/nix`, add that it takes effect once the Nix daemon has been
    restarted after the edit, since the check cannot see the daemon's own
@@ -628,9 +627,13 @@ Run at the start of `serve` (which then serves regardless) and by `check`
    ```
    extra-substituters = http://127.0.0.1:8484
    extra-trusted-public-keys = narrenhaus-1a2b3c4d:<base64>
+   fallback = true
    ```
 
-   and where they go, first case that applies:
+   with one sentence on what `fallback = true` is for and what it changes
+   (section 8.1). A missing `fallback` line may always go in
+   `~/.config/nix/nix.conf`. Where the other two go, first case that
+   applies:
    - the daemon trusts the user: `~/.config/nix/nix.conf`, which needs
      neither root nor a restart;
    - `/etc/nix/nix.conf` is a link into the Nix store or `/etc/static`
@@ -653,27 +656,31 @@ Run at the start of `serve` (which then serves regardless) and by `check`
 The check reads and prints; it writes nothing outside narrenhaus's own
 directories.
 
-### 8.1 When narrenhaus is not running (open, section 2.4)
+### 8.1 When narrenhaus is not running
 
-Checked in Nix's source for 2.26.1 and 2.35.4: once narrenhaus is in
+Read in Nix's source for 2.26.1 and 2.35.4, not run: once narrenhaus is in
 `substituters`, and Nix has its `nix-cache-info` remembered (7 days), a
 narrenhaus that is not running makes Nix fail any operation that needs a
 path no earlier cache has, unless `fallback = true`. Before 2.32 any dead
 substituter is fatal; from 2.32 only the last one asked is, and priority 50
 makes narrenhaus the last. The owner starts narrenhaus by hand, so "not
-running" is an everyday state. The two ways out:
+running" is an everyday state.
 
-- **Suggest `fallback = true`** as a third line and have the check report
-  when it is off. It may go in the user's own file for any user. Its cost:
-  it applies to every cache, so a failed download from cache.nixos.org
-  also turns into a local build instead of an error.
-- **Announce a priority before cache.nixos.org** (below 40). From Nix 2.32
-  a failing narrenhaus is then skipped, because another cache comes after
-  it. Its costs: narrenhaus is asked for every path Nix wants, each a
-  lookup on the server; paths that cache.nixos.org also has are fetched
-  through narrenhaus when a colleague pushed them; while narrenhaus is
-  down each query waits through a few seconds of retries; and Nix before
-  2.32 still fails.
+The owner's choice is to **suggest `fallback = true`** as a third line and
+have the check report when it is off. With it Nix logs the failure,
+leaves the dead cache alone for 60 seconds and goes on to other caches or
+builds. Its cost, which the advice states: it applies to every cache, so a
+failed download from cache.nixos.org also turns into a local build instead
+of an error.
+
+Not chosen: announcing a priority before cache.nixos.org. From Nix 2.32 a
+failing narrenhaus would then be skipped, but narrenhaus would be asked for
+every path Nix wants, each query would wait through retries while it is
+down, and Nix before 2.32 would still fail.
+
+The real-Nix tests of section 13 include this case: with the three lines
+in place and narrenhaus stopped, a build that needs a path only narrenhaus
+could have still succeeds.
 
 ## 9. jaccard-store
 
@@ -838,7 +845,8 @@ pushes still running then are abandoned.
   not close it.
 - Nothing on the server expires.
 - A configured narrenhaus that is not running fails Nix operations unless
-  section 8.1's remedy is in place.
+  `fallback = true` is set, which the setup advice asks for (section 8.1).
+  With it, a failed download from any cache becomes a local build.
 
 ## 13. Testing
 
