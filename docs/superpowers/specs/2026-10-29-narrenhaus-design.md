@@ -1,6 +1,7 @@
 # narrenhaus: design
 
-Date: 2026-10-29. Status: complete, waiting for the owner's approval.
+Date: 2026-10-29. Status: approved by the owner ("looks good, go ahead and
+do it all"), including the calls of section 2.3.
 Reviewed twice against jaccard-store v0.7.0, Amber-Store Core v0.10.0 and
 the source of Nix 2.26.1 and 2.35.4 (the owner's machine runs 2.35.4).
 Nothing in it has been run against a live cache.
