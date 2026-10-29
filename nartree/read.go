@@ -41,6 +41,14 @@ var (
 // directory's. Core's builders make a level at least twice as small as
 // the one below, so a file of 2^63 bytes stays far under it; a deeper
 // index was built to exhaust the reader.
+//
+// The depth alone bounds no work, since an index may name one child any
+// number of times. What bounds it is that every child of an index gives
+// the archive something: a child of a FileNode a byte at least, a child of
+// a DirNode an entry. Core's builders make no other, an empty file being
+// the bare empty Blob and an empty directory the bare empty DirLeaf, and a
+// tree that has one is refused. So a reader does no more work than the
+// bytes it writes, times the depth.
 const maxIndexDepth = 64
 
 // brokenf returns an error that wraps ErrBroken.
@@ -163,10 +171,11 @@ func Open(root key.Key, get Getter) (Content, error) {
 // It fails, wrapping ErrBroken, if the tree is no archive's: a file's
 // bytes differ in number from its content key's length, entries are out
 // of order or named as no entry can be, an entry is neither file,
-// directory nor symlink, the nesting is deeper than an archive's, or an
-// object does not decode. An error of get is returned wrapped and is not
-// ErrBroken; an error of w is returned as it is. In each case w has been
-// given the beginning of an archive and not its end.
+// directory nor symlink, the nesting is deeper than an archive's, an index
+// names a child that holds nothing, or an object does not decode. An error
+// of get is returned wrapped and is not ErrBroken; an error of w is
+// returned as it is. In each case w has been given the beginning of an
+// archive and not its end.
 //
 // Objects are read one at a time, a file's Blobs in order, so memory in
 // use does not grow with the archive. Each object's bytes go to w in one
@@ -235,6 +244,9 @@ func (a *archiver) directory(k key.Key, level int) error {
 		if err != nil {
 			return brokenf("the DirLeaf %s does not decode: %v", k, err)
 		}
+		if level > 0 && len(entries) == 0 {
+			return brokenf("the index of a directory has the DirLeaf %s as a child, which has no entry", k)
+		}
 		for _, e := range entries {
 			if err := a.node(string(e.Name), e); err != nil {
 				return err
@@ -245,6 +257,9 @@ func (a *archiver) directory(k key.Key, level int) error {
 		pairs, err := fstree.DecodeDirNode(data)
 		if err != nil {
 			return brokenf("the DirNode %s does not decode: %v", k, err)
+		}
+		if len(pairs) == 0 {
+			return brokenf("the DirNode %s has no child", k)
 		}
 		for _, p := range pairs {
 			ck, err := key.Parse(p.ChildKey)
@@ -271,7 +286,8 @@ func (a *archiver) directory(k key.Key, level int) error {
 // down: a Blob must have the length its key states and a FileNode the sum
 // of its children's, so a file that would come out longer or shorter
 // than its key says is refused where the difference is, before the bytes
-// in question are written. An error of w is returned as it is.
+// in question are written. A FileNode with a child of no bytes is refused
+// as well (see maxIndexDepth). An error of w is returned as it is.
 func writeContent(w io.Writer, k key.Key, get Getter, level int) error {
 	if level >= maxIndexDepth {
 		return brokenf("the index of a file is more than %d levels deep at %s", maxIndexDepth, k)
@@ -299,6 +315,9 @@ func writeContent(w io.Writer, k key.Key, get Getter, level int) error {
 		for _, c := range children {
 			if t := c.Type(); t != key.Blob && t != key.FileNode {
 				return brokenf("the FileNode %s has a %s as a child", k, t)
+			}
+			if c.Length() == 0 {
+				return brokenf("the FileNode %s has a child of no bytes", k)
 			}
 			if sum, carry = bits.Add64(sum, c.Length(), 0); carry != 0 {
 				return brokenf("the lengths of the children of the FileNode %s exceed 64 bits", k)

@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -608,6 +610,10 @@ func TestOpenNotAWrapper(t *testing.T) {
 			o.m[rk] = append(o.m[rk], ' ')
 			return o.directory(t, regularEntry("nar", o.blob(t, "contents")), regularEntry("recipe", rk))
 		}},
+		{"a recipe with an index over an empty Blob", func(t *testing.T, o *objects) key.Key {
+			rk := o.fileNode(t, uint64(len(v1)), o.blob(t, v1), o.blob(t, ""))
+			return o.directory(t, regularEntry("nar", o.blob(t, "contents")), regularEntry("recipe", rk))
+		}},
 		{"an empty recipe", withRecipe("")},
 		{"a recipe that is not JSON", withRecipe("version 1")},
 		{"a recipe that is a JSON array", withRecipe(`["narrenhaus-recipe",1]`)},
@@ -872,6 +878,11 @@ func TestIngestIsStreaming(t *testing.T) {
 		size  = 64 << 20
 		limit = 16 << 20
 	)
+	// The bound is on what the package keeps, not on how seldom the
+	// collector runs: it is measured with the collector's default setting,
+	// whatever GOGC and GOMEMLIMIT say where the test runs.
+	defer debug.SetGCPercent(debug.SetGCPercent(100))
+	defer debug.SetMemoryLimit(debug.SetMemoryLimit(math.MaxInt64))
 	var peak uint64
 	sample := func() {
 		var m runtime.MemStats
@@ -1196,6 +1207,17 @@ func (o *objects) fileNode(t *testing.T, length uint64, children ...key.Key) key
 	return o.raw(t, key.FileNode, length, obj.Bytes)
 }
 
+// dirNode stores a DirNode of pairs exactly as given and returns its key.
+func (o *objects) dirNode(t *testing.T, pairs ...fstree.DirPair) key.Key {
+	t.Helper()
+	obj, err := fstree.EncodeDirNode(pairs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.emit(obj)
+	return obj.Key
+}
+
 func TestWriteNARRefusesABrokenTree(t *testing.T) {
 	type build func(t *testing.T, o *objects) fstree.Entry
 	inDir := func(entries func(t *testing.T, o *objects) []fstree.Entry) build {
@@ -1256,6 +1278,12 @@ func TestWriteNARRefusesABrokenTree(t *testing.T) {
 			}
 			return regularEntry("nar", k)
 		}},
+		{"a FileNode over an empty Blob", func(t *testing.T, o *objects) fstree.Entry {
+			return regularEntry("nar", o.fileNode(t, 3, o.blob(t, "one"), o.blob(t, "")))
+		}},
+		{"a FileNode over a FileNode of nothing", func(t *testing.T, o *objects) fstree.Entry {
+			return regularEntry("nar", o.fileNode(t, 3, o.fileNode(t, 0), o.blob(t, "one")))
+		}},
 		{"a file whose key is a directory's", func(t *testing.T, o *objects) fstree.Entry {
 			return regularEntry("nar", o.directory(t))
 		}},
@@ -1303,6 +1331,17 @@ func TestWriteNARRefusesABrokenTree(t *testing.T) {
 			}
 			data := append(bytes.Clone(obj.Bytes[:at]), 0x45, 'n', 'o', 'k', 'e', 'y')
 			return directoryEntry("nar", o.raw(t, key.DirNode, uint64(len(data)), data))
+		}},
+		{"a directory index over an empty leaf", func(t *testing.T, o *objects) fstree.Entry {
+			first, empty := o.leaf(t, symlinkEntry("a", "x")), o.leaf(t)
+			return directoryEntry("nar", o.dirNode(t, fstree.DirPair{SepName: []byte("a"), ChildKey: first[:]}, fstree.DirPair{SepName: []byte("b"), ChildKey: empty[:]}))
+		}},
+		{"a directory index without a child", func(t *testing.T, o *objects) fstree.Entry {
+			return directoryEntry("nar", o.dirNode(t))
+		}},
+		{"a directory index over one without a child", func(t *testing.T, o *objects) fstree.Entry {
+			first, empty := o.leaf(t, symlinkEntry("a", "x")), o.dirNode(t)
+			return directoryEntry("nar", o.dirNode(t, fstree.DirPair{SepName: []byte("a"), ChildKey: first[:]}, fstree.DirPair{SepName: []byte("b"), ChildKey: empty[:]}))
 		}},
 		{"directory indexes nested without end", func(t *testing.T, o *objects) fstree.Entry {
 			k := o.leaf(t, symlinkEntry("a", "b"))
@@ -1384,6 +1423,103 @@ func TestWriteNARRefusesABrokenTree(t *testing.T) {
 			t.Log(err)
 		})
 	}
+}
+
+// TestIndexThatHoldsNothingCostsNoWork checks that an index cannot make
+// its reader work without giving it anything: one that names a child of no
+// bytes, or of no entries, twice at each of its levels would be read in a
+// number of steps that doubles with every level.
+func TestIndexThatHoldsNothingCostsNoWork(t *testing.T) {
+	const levels = 22
+	v1 := someRecipe()
+	cases := []struct {
+		name string
+		read func(o *objects) error
+	}{
+		{"a file", func(o *objects) error {
+			k := o.blob(t, "")
+			for range levels {
+				k = o.fileNode(t, 0, k, k)
+			}
+			return WriteNAR(io.Discard, regularEntry("nar", k), o.get)
+		}},
+		{"a directory", func(o *objects) error {
+			k := o.leaf(t)
+			for range levels {
+				k = o.dirNode(t, fstree.DirPair{SepName: []byte("a"), ChildKey: k[:]}, fstree.DirPair{SepName: []byte("b"), ChildKey: k[:]})
+			}
+			return WriteNAR(io.Discard, directoryEntry("nar", k), o.get)
+		}},
+		{"a recipe", func(o *objects) error {
+			k := o.blob(t, "")
+			for range levels {
+				k = o.fileNode(t, 0, k, k)
+			}
+			rk := o.fileNode(t, uint64(len(v1)), o.blob(t, v1), k)
+			_, err := Open(o.directory(t, regularEntry("nar", o.blob(t, "contents")), regularEntry("recipe", rk)), o.get)
+			return err
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			o := newObjects()
+			err := tc.read(o)
+			if !errors.Is(err, ErrBroken) {
+				t.Errorf("%v, want ErrBroken", err)
+			}
+			if o.gets > 2*levels {
+				t.Errorf("%d objects were read of an index of %d levels", o.gets, levels)
+			}
+		})
+	}
+}
+
+// TestIngestRefusesAnArchiveThatIsTooLarge checks the limit on the bytes
+// of an archive, with limits a test can reach.
+func TestIngestRefusesAnArchiveThatIsTooLarge(t *testing.T) {
+	if MaxNARSize != 64<<30 {
+		t.Errorf("MaxNARSize is %d, want 64 GiB", uint64(MaxNARSize))
+	}
+	archive := write(t, []event{dir(""), file("a", "small"), file("big", string(noiseBytes(5, 300_000))), link("z", "big"), leave()})
+	size := uint64(len(archive))
+
+	node, narHash, narSize, err := ingestUpTo(bytes.NewReader(archive), newObjects().emit, size)
+	if err != nil || narSize != size || narHash != sha256.Sum256(archive) || string(node.Name) != "nar" {
+		t.Fatalf("an archive of the limit's length: size %d, hash %x, node %q, %v", narSize, narHash, node.Name, err)
+	}
+	for _, limit := range []uint64{size - 1, size / 2, 100, 0} {
+		// The reader has no end: what stops the reading is the limit.
+		read := &counted{r: io.MultiReader(bytes.NewReader(archive), newNoise(1))}
+		node, narHash, narSize, err := ingestUpTo(read, newObjects().emit, limit)
+		if !errors.Is(err, ErrTooLarge) || errors.Is(err, nar.ErrMalformed) {
+			t.Fatalf("limit %d: %v, want ErrTooLarge", limit, err)
+		}
+		if node.Name != nil || node.ContentKey != nil || narHash != [32]byte{} || narSize != 0 {
+			t.Errorf("limit %d: Ingest failed and returned a node, a hash or a size", limit)
+		}
+		// It stops where the limit is passed, not at the archive's end:
+		// within what the parser reads ahead.
+		if read.n > limit+1<<20 {
+			t.Errorf("limit %d: %d bytes were read", limit, read.n)
+		}
+	}
+	// A reader's error at the limit is not the archive's being too large.
+	cause := errors.New("connection reset")
+	if _, _, _, err := ingestUpTo(&failing{bytes.NewReader(archive[:100]), cause}, newObjects().emit, 100); err != cause {
+		t.Errorf("the reader failing at the limit: %v, want %v as it is", err, cause)
+	}
+}
+
+// counted counts the bytes read through it.
+type counted struct {
+	r io.Reader
+	n uint64
+}
+
+func (c *counted) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += uint64(n)
+	return n, err
 }
 
 // TestWriteNARWritesNoByteBeyondAFile checks that a file whose objects
