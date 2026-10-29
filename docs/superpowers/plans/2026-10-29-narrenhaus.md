@@ -2,11 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Updated after the whole-branch review:** the Tech Stack line and the interface blocks of Tasks B3, B5, B6, B8, B9 and B10 state the interfaces as the fixes that followed the review left them: the xz decoder, the limit of `nartree.Ingest` with `MaxNARSize` and `ErrTooLarge`, `packcache.ErrForeign` and `ErrLimit`, `testserver.Forget`, `remote.Config.RepeatAfter`, `httpd.Config.Host`, and the fields of `nixconf.Env` for the user's configuration file. The tasks, their steps and their lists of tests are as they were written and were not revised; where they differ from the program, the spec as revised holds.
+
 **Goal:** A local Nix binary cache daemon, `narrenhaus`, that stores NARs as chunked core objects on a jaccard-store server (two references per store path) and serves them back uncompressed from a size-bounded local cache of pack files.
 
 **Architecture:** Part A adds two things to jaccard-store's `client` package (push from any object source; lookup and fetch packs without a packstore) and releases them as v0.8.0. Part B builds narrenhaus on that release as flat Go packages: `nar` (strict NAR codec), `nartree` (NAR ⇄ core objects), `narinfo`, `packcache` (expanded pack files with LRU eviction), `remote` (one shared iroh connection), `refs` (making references local and verified), `upload` (staging and push work), `httpd` (the binary-cache HTTP surface), `nixconf` (setup check), `cmd/narrenhaus`.
 
-**Tech Stack:** Go 1.26.3 (as jaccard-store's `go.mod`), `github.com/amber-store/jaccard-store` v0.8.0, `github.com/amber-store/core` v0.10.0, `github.com/urfave/cli/v2`, `github.com/klauspost/compress` (zstd, gzip), `github.com/ulikunitz/xz`, stdlib `compress/bzip2`, `crypto/ed25519`; flake with gonixgo v0.5.0.
+**Tech Stack:** Go 1.26.3 (as jaccard-store's `go.mod`), `github.com/amber-store/jaccard-store` v0.8.0, `github.com/amber-store/core` v0.10.0, `github.com/urfave/cli/v2`, `github.com/klauspost/compress` (zstd, gzip), `github.com/xi2/xz` (the xz decoder, which takes a limit on the dictionary; `github.com/ulikunitz/xz` only in tests, to write xz), stdlib `compress/bzip2`, `crypto/ed25519`; flake with gonixgo v0.5.0.
 
 **Spec:** `docs/superpowers/specs/2026-10-29-narrenhaus-design.md` (in `~/amber-store/narrenhaus`). Section numbers below ("spec 5.1") refer to it. Every implementer reads the spec sections named in their task before writing code.
 
@@ -251,10 +253,19 @@ Work in `/Users/dragan/amber-store/narrenhaus`. Part B starts only after `v0.8.0
   // Node is the NAR's root node as an entry named "nar".
   type Node = fstree.Entry
 
+  // MaxNARSize is the longest archive narrenhaus takes, in bytes: 64 GiB.
+  // An upload gives it to Ingest as the limit, and a reference whose
+  // recipe states more is not rebuilt.
+  const MaxNARSize = 64 << 30
+
+  // ErrTooLarge is an archive of more bytes than the limit given to Ingest.
+  var ErrTooLarge = errors.New("nartree: the archive is too large")
+
   // Ingest reads one NAR from r, emits its objects and returns its root
   // node with the SHA-256 and length of the bytes read. Errors of the
-  // archive wrap nar.ErrMalformed.
-  func Ingest(r io.Reader, emit fstree.Emit) (node Node, narHash [32]byte, narSize uint64, err error)
+  // archive wrap nar.ErrMalformed, or ErrTooLarge at the read that takes
+  // the archive beyond limit bytes. The limit is the caller's.
+  func Ingest(r io.Reader, emit fstree.Emit, limit uint64) (node Node, narHash [32]byte, narSize uint64, err error)
 
   // File emits the content objects of a file and returns its content key,
   // as core's ingest builds one.
@@ -374,15 +385,19 @@ Work in `/Users/dragan/amber-store/narrenhaus`. Part B starts only after `v0.8.0
   type Origin struct{ Server, Prefix string }
 
   var (
-      ErrOrigin = errors.New("packcache: directory belongs to another server or prefix")
-      ErrInUse  = errors.New("packcache: directory is in use by another process")
-      ErrAbsent = errors.New("packcache: no such object")
+      ErrOrigin  = errors.New("packcache: directory belongs to another server or prefix")
+      ErrForeign = errors.New("packcache: directory is not a cache directory") // no origin, and not empty either
+      ErrInUse   = errors.New("packcache: directory is in use by another process")
+      ErrAbsent  = errors.New("packcache: no such object")
+      ErrLimit   = errors.New("packcache: beyond the limits of a pack") // Writer.Add: no failed write, and no repeat cures it
   )
 
   // Open opens or creates the cache directory of spec 7.1, takes an
   // exclusive lock on it (a flock on <dir>/lock), removes packs without
   // .meta and everything under tmp/ and staging/, and recreates missing
-  // subdirectories. limit is the size limit in bytes.
+  // subdirectories. limit is the size limit in bytes. A directory in use
+  // (ErrInUse), of another origin (ErrOrigin) or without an origin and not
+  // empty (ErrForeign, spec 7.1) is refused and left as it was.
   func Open(dir string, limit uint64, origin Origin) (*Cache, error)
   func (c *Cache) Close() error
   func (c *Cache) TempDir() string // <dir>/tmp
@@ -392,7 +407,7 @@ Work in `/Users/dragan/amber-store/narrenhaus`. Part B starts only after `v0.8.0
   // (NewStaged) or tmp/ (NewDownload).
   func (c *Cache) NewStaged() (*Writer, error)
   func (c *Cache) NewDownload() (*Writer, error)
-  func (w *Writer) Add(k key.Key, data []byte) error // a key already added is skipped
+  func (w *Writer) Add(k key.Key, data []byte) error // a key already added is skipped; an object beyond what a pack may hold (a key that is not canonical, more than 256 MiB, one more than 2^24 objects) is refused with ErrLimit
   func (w *Writer) Discard()
   // Seal ends writing, writes the index beside the data and returns the
   // file as a readable set of objects.
@@ -477,6 +492,11 @@ Work in `/Users/dragan/amber-store/narrenhaus`. Part B starts only after `v0.8.0
   func (s *Server) Restart()
   // DropConnections closes every client connection from the server's side.
   func (s *Server) DropConnections()
+  // Forget makes the server lose every client connection without a word to
+  // its client: the endpoint goes away with its connections as they are,
+  // and a new one answers at the same address. On a stopped server it does
+  // nothing.
+  func (s *Server) Forget()
   // SlowBucket makes every bucket transfer wait d before its first byte; zero undoes it.
   func (s *Server) SlowBucket(d time.Duration)
   ```
@@ -493,6 +513,13 @@ Work in `/Users/dragan/amber-store/narrenhaus`. Part B starts only after `v0.8.0
       Dial          func(ctx context.Context) (Conn, error)
       HTTP          *http.Client  // bucket transfers; nil means one whose transfers fail after 30 s without a byte
       LookupTimeout time.Duration // 0 means 10 s: connection plus lookup round trip
+      // RepeatAfter is how long a lookup waits for its answer on a
+      // connection that was up before it; then it is repeated on a fresh
+      // one. It is also the least a lookup must have waited on a connection
+      // for its silence to retire it. 0 means 3 s, or three tenths of
+      // LookupTimeout where that is less; never more than half of
+      // LookupTimeout.
+      RepeatAfter   time.Duration
       DialTimeout   time.Duration // 0 means 30 s
       FailFast      time.Duration // 0 means 30 s after a failed dial
       Log           *slog.Logger
@@ -510,9 +537,10 @@ Work in `/Users/dragan/amber-store/narrenhaus`. Part B starts only after `v0.8.0
   func (r *Remote) Reachable(ctx context.Context) error
 
   // Lookup is client.Lookup within LookupTimeout. client.ErrNotFound for an
-  // unknown name; ErrUnreachable when the server could not be asked. A
-  // lookup that fails on a connection that was up is repeated once on a
-  // fresh one within the same limit.
+  // unknown name; ErrUnreachable when the server could not be asked. On a
+  // connection that was up before it, a lookup waits RepeatAfter for its
+  // answer; without one, or when that connection fails it or is retired
+  // meanwhile, it is repeated once on a fresh one within the same limit.
   func (r *Remote) Lookup(ctx context.Context, name string) (key.Key, []client.Pack, error)
 
   // Fetch is client.Fetch; it has no time limit of its own.
@@ -525,7 +553,7 @@ Work in `/Users/dragan/amber-store/narrenhaus`. Part B starts only after `v0.8.0
   // cure: the server answered bad_request or malformed_pack.
   func ForGood(err error) bool
   ```
-  Connection rules: spec 9.3 verbatim (retire on stream-open or frame failure or lookup timeout; never for `ErrNotFound`, a `*wire.Error`, a bucket error or `client.ErrBadPack`; only the first failing call retires; closed when its last call returns; dials serialised, run under `Remote`'s own context, fail-fast window after a failed dial). The default `HTTP` client enforces the 30-second stall rule with a transport whose response bodies fail when a read gets no byte for 30 s.
+  Connection rules: spec 9.3 verbatim (retire on stream-open or frame failure or a lookup's wait in vain, by the rule of `RepeatAfter`; never for `ErrNotFound`, a `*wire.Error`, a bucket error or `client.ErrBadPack`; only the first failing call retires; closed when its last call returns; dials serialised, run under `Remote`'s own context, fail-fast window after a failed dial). The default `HTTP` client enforces the 30-second stall rule with a transport whose response bodies fail when a read gets no byte for 30 s.
 
 - [ ] **Step 1: Failing tests** in `remote/remote_test.go` against `testserver`: `TestLookupNotFound`; `TestLookupAfterTheConnectionDied` (`DropConnections`, then a lookup of an existing name succeeds: one redial); `TestLookupWhenTheServerIsDown` (`Stop`: error wraps `ErrUnreachable` within `LookupTimeout` set to 500 ms; a second lookup inside `FailFast` returns in under 50 ms); `TestRecoversAfterFailFast` (`Restart`, wait out a 200 ms `FailFast`, lookup succeeds); `TestRefusalDoesNotRetire` (a `Push` the server refuses with `bad_request` — a name with `@` — leaves a concurrent slow `Push` running to success; `ForGood` is true for the refusal); `TestRetiredConnectionOutlivesItsCalls` (a `Push` in flight, slowed by `SlowBucket`, while another call's lookup times out: the push still finishes); `TestDialsAreSerialised` (20 concurrent lookups on a fresh `Remote`: `Dial` was called once); `TestReachable`; `TestStalledTransferFails` (default HTTP client, a bucket that sends headers and then nothing: `Fetch` fails within the stall limit, set to 300 ms through an unexported knob).
 - [ ] **Step 2: Run** `go test ./remote/` — compile failure.
@@ -614,7 +642,9 @@ Work in `/Users/dragan/amber-store/narrenhaus`. Part B starts only after `v0.8.0
   // Reader recognises r's compression by its first bytes (xz, zstd, gzip,
   // bzip2, or an uncompressed NAR's header) and returns the decompressed
   // stream. zstd input may be several frames. compressed says whether r
-  // was compressed at all.
+  // was compressed at all. A body that asks its reader for more memory
+  // than one of Nix does, an xz dictionary above 64 MiB or a zstd window
+  // above 128 MiB, fails when out is read.
   func Reader(r io.Reader) (out io.Reader, compressed bool, err error)
   ```
   ```go
@@ -683,10 +713,16 @@ Work in `/Users/dragan/amber-store/narrenhaus`. Part B starts only after `v0.8.0
       Key       narinfo.SigningKey
       Priority  int
       ServeWait time.Duration // 0 means 240 s: how long a narinfo or NAR request waits for its reference
+      // Host is the host the cache listens at. When it is a name, requests
+      // that call the cache by it are answered; requests that call it by an
+      // IP address or localhost always are.
+      Host      string
       Log       *slog.Logger
   }
   func New(cfg Config) http.Handler
   ```
+  Before any route, a request that is a web page's by spec 6.4 (a `Host` that is neither an IP address, `localhost` nor `Config.Host`; an `Origin` on a `PUT`; a `Sec-Fetch-Site` of another site) is refused: a `PUT` with 403, anything else with 404.
+
   Routes (anything else is 404; a `PUT` to anything else is 405):
 
   | Method and path | Answer |
@@ -727,6 +763,15 @@ Work in `/Users/dragan/amber-store/narrenhaus`. Part B starts only after `v0.8.0
       ReadFile func(path string) ([]byte, error)
       Readlink func(path string) (string, error)
       Home     string // the user's home directory
+      // ConfigHome is XDG_CONFIG_HOME, under which Nix looks for the user's
+      // nix/nix.conf. Empty means Home/.config.
+      ConfigHome string
+      // UserConfFiles is NIX_USER_CONF_FILES, and UserConfFilesSet whether
+      // the variable is set at all. Nix then reads the user's settings from
+      // the files it names, separated by colons, the first having the last
+      // word, and from none under ConfigHome.
+      UserConfFiles    string
+      UserConfFilesSet bool
   }
   // System is the Env of the real machine.
   func System() Env
