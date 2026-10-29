@@ -58,9 +58,9 @@ const (
 )
 
 // MaxNARSize is the longest archive narrenhaus takes, in bytes: 64 GiB.
-// It bounds what the check of a reference can cost, which is the hashing
-// of its archive: it is the limit an upload gives to Ingest, and a
-// reference whose recipe states more is not rebuilt.
+// It bounds the bytes the check of a reference writes: it is the limit an
+// upload gives to Ingest, and a reference whose recipe states more is not
+// rebuilt.
 const MaxNARSize = 64 << 30
 
 // ErrTooLarge is an archive of more bytes than the limit given to Ingest.

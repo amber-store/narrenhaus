@@ -93,8 +93,9 @@ func (s *Store) open(r ref, sum [32]byte, hold *packcache.Hold) (*Content, error
 // A recipe that states more than nartree.MaxNARSize bytes is broken
 // without a rebuild. With that, and with the rebuild ending at the first
 // byte beyond what the recipe states, the check of any reference, however
-// it was built, costs no more than the hashing of an archive of that
-// length.
+// it was built, writes no more than an archive of that length. Its work
+// is not bounded by that alone: each byte may cost the reading of one
+// object for each level of an index.
 func (s *Store) checkContent(r ref, hold *packcache.Hold, got *progress) error {
 	opened, err := nartree.Open(r.root, sound(hold.Get))
 	switch {

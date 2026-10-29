@@ -240,6 +240,15 @@ The shared server
 - Anyone who knows the server's endpoint ID can read, replace and delete
   any reference. The prefix is a name, not a boundary. A narinfo is trusted
   to state its NAR's size truthfully.
+- A reference can be built so that checking it costs far more than its
+  size suggests. The 64 GiB limit bounds the bytes a check writes, not its
+  work: a tree made for it has each byte read through many levels of
+  index. narrenhaus does not bound this further, since those who can write
+  a reference are trusted.
+- A broken reference stored as a patch costs each laptop its cached base
+  pack once: before the reference is judged broken, the base pack is
+  dropped and downloaded again, and the path the base pack belongs to is
+  checked again at its next request.
 - Nothing on the server expires, and a store path costs two references
   there. A NAR whose narinfo never arrived stays on the server.
 - Paths pushed at the same time cannot be stored as patches of one another,

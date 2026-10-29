@@ -36,17 +36,18 @@ Success: on laptop A, `nix copy --to http://127.0.0.1:8484 <path>` succeeds;
 on laptop B, with narrenhaus configured as a substituter and the same server
 and prefix, Nix substitutes `<path>` from it and the path it imports has the
 NAR hash the narinfo names. Answering a narinfo fetches no NAR content. B's
-pack cache returns under its size limit when no request holds it above and
-no reference made local is still kept for a request that gave up, which is
-15 minutes at most. A narrenhaus that is not yet in the Nix configuration
+pack cache returns under its size limit when no request holds it above, no
+work is still making a reference local, and no reference made local is
+still kept for a request that gave up; that keeping ends 15 minutes after
+the work at most. A narrenhaus that is not yet in the Nix configuration
 says exactly what to add and where.
 
-*Changed by the revision after the review, and not yet confirmed by the
-owner: the sentence on the pack cache. As approved it read "B's pack cache
-returns under its size limit whenever no request holds it above." The
-packs of a reference that was made local are now kept for the request that
-gave up waiting for them; section 2.3, entry 26, has the decision and its
-reason.*
+*Changed after the review of the built program, and not yet confirmed by
+the owner: the sentence on the pack cache. As approved it read "B's pack
+cache returns under its size limit whenever no request holds it above."
+The work that makes a reference local holds its packs while it runs, also
+after its request gave up, and the packs are then kept for the next
+request; section 2.3, entry 26, has the decision and its reason.*
 
 ## 2. Decisions
 
@@ -306,8 +307,8 @@ check costs. The owner has not yet confirmed any of entries 23 to 45.
 36. **The verdict "broken" is passed only on packs that came from the
     server for the work that passes it, and it takes only the reference's
     own pack out of the cache** (section 6.4). Packs that were in the
-    cache may have suffered there, so when a reference looks broken they
-    are dropped and fetched again first, in at most three rounds, after
+    cache may have suffered there, so when a reference looks broken once
+    its packs are local they are dropped and fetched again first, in at most three rounds, after
     which the work ends with a 404 and no verdict. The parent pack is not
     dropped with a broken reference: it was checked object by object when
     it came, and it is the base of other references. The cost: a parent
@@ -701,7 +702,8 @@ In order:
    - a `Sig` that is not a key's name that is not empty, a colon and the
      base 64 of 64 bytes;
    - a second `References` line and a second `CA` line. Of any other key
-     given twice the last one counts, as for Nix;
+     given twice the last one counts, as for Nix, except `Sig`: every
+     `Sig` line is a signature of its own and all are kept;
    - a `CA` line that the following rule refuses.
 
    A `CA` line that is not empty must be a content address Nix 2.35.4
@@ -1098,8 +1100,12 @@ Run at the start of `serve` (which then serves regardless) and by `check`
    from the environment. All runs of `nix` in one check share a limit of
    20 seconds, so that a Nix daemon that does not answer cannot keep
    `serve` from starting. A run that the limit cuts is a run that failed:
-   for the configuration that is step 6, and for the question of trust it
-   means not trusted.
+   for the two readings of the configuration above that is step 6, and for
+   the question of trust it means not trusted. (For a trusted user whose
+   setup is complete the daemon's view is read once more, only to say
+   where the settings are; if that run fails, the answer stays
+   "configured" and says what holds if the settings are in a file under
+   `/etc/nix`.)
 2. Configured means all of:
    - `substituters` has an entry equal to narrenhaus's URL after dropping a
      trailing slash and any `?parameters`. The URL is `http://` plus the
@@ -1408,7 +1414,9 @@ without waiting for requests or work, however the process was started.
   sent. The program does not bound this further. It is accepted because
   those who can write a reference are trusted (sections 2.1, 6.3).
 - **A broken patch costs a laptop its cached base pack once.** When a
-  reference looks broken and its parent pack was in the cache, the parent
+  reference is found broken once its packs are local (by its tree, its
+  recipe, its NAR or its narinfo text) and its parent pack was in the
+  cache, the parent
   is dropped and downloaded again before the verdict is passed, and the
   reference whose own pack the parent is has its NAR checked again at its
   next request. This happens once for each broken reference and each run
