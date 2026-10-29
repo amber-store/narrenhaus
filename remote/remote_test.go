@@ -830,7 +830,10 @@ func TestLookupOnASilentConnection(t *testing.T) {
 		}
 
 		// The second connection had the rest of the limit to answer in and
-		// is retired as the first was.
+		// is retired as the first was: by the lookup that got no answer,
+		// not by the next one, which would find it up and give it a short
+		// attempt of its own. No call is left on it, so it is closed.
+		eventually(t, "the second silent connection is closed", d.conn(t, 1).closed.Load)
 		d.mute.Store(false)
 		if _, _, err := r.Lookup(ctx, "acme/absent"); !errors.Is(err, client.ErrNotFound) {
 			t.Fatalf("Lookup after two silent connections: %v, want client.ErrNotFound", err)
@@ -838,7 +841,34 @@ func TestLookupOnASilentConnection(t *testing.T) {
 		if n := d.calls.Load(); n != 3 {
 			t.Fatalf("%d dials, want 3", n)
 		}
-		eventually(t, "the second silent connection is closed", d.conn(t, 1).closed.Load)
+	})
+
+	t.Run("that was dialled for it has the whole limit", func(t *testing.T) {
+		const (
+			lookupTimeout = time.Second
+			repeatAfter   = 200 * time.Millisecond
+		)
+		srv := testserver.Start(t, testserver.Options{})
+		d := &dialer{dial: srv.Dial()}
+		d.mute.Store(true)
+		r := newRemote(t, remote.Config{Dial: d.Dial, LookupTimeout: lookupTimeout, RepeatAfter: repeatAfter})
+
+		// Nothing was dialled before: the connection is new, and a new one
+		// is not given up after RepeatAfter for another.
+		started := time.Now()
+		_, _, err := r.Lookup(context.Background(), "acme/absent")
+		took := time.Since(started)
+		if !errors.Is(err, remote.ErrUnreachable) {
+			t.Fatalf("Lookup without an answer: %v, want ErrUnreachable", err)
+		}
+		if took < lookupTimeout || took > lookupTimeout+250*time.Millisecond {
+			t.Fatalf("Lookup without an answer took %v, the limit is %v", took, lookupTimeout)
+		}
+		if n := d.calls.Load(); n != 1 {
+			t.Fatalf("%d dials, want 1: a connection dialled for the lookup is not left for another", n)
+		}
+		// It was silent for the whole limit, and is retired for that.
+		eventually(t, "the silent connection is closed", d.conn(t, 0).closed.Load)
 	})
 
 	t.Run("that came late is not retired", func(t *testing.T) {

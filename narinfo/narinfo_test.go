@@ -699,12 +699,62 @@ func TestParseCA(t *testing.T) {
 	}
 }
 
+// nixOlderThan reports whether version, the line `nix --version` prints,
+// is that of a Nix before major.minor. ok is false when the line does not
+// end in a version.
+func nixOlderThan(version string, major, minor int) (older, ok bool) {
+	fields := strings.Fields(version)
+	if len(fields) == 0 {
+		return false, false
+	}
+	var a, b int
+	if n, _ := fmt.Sscanf(fields[len(fields)-1], "%d.%d", &a, &b); n != 2 {
+		return false, false
+	}
+	return a < major || (a == major && b < minor), true
+}
+
+func TestNixOlderThan(t *testing.T) {
+	for _, c := range []struct {
+		version   string
+		older, ok bool
+	}{
+		{"nix (Nix) 2.35.4\n", false, true},
+		{"nix (Nix) 2.31.0\n", false, true},
+		{"nix (Nix) 2.30.2\n", true, true},
+		{"nix (Nix) 2.26.1\n", true, true},
+		{"nix (Nix) 2.9.2\n", true, true}, // by number, not by letter
+		{"nix (Nix) 2.4pre20210601_5985b8b\n", true, true},
+		{"nix (Nix) 1.11.16\n", true, true},
+		{"nix (Nix) 3.0.0\n", false, true},
+		{"nix (Nix) 2.31\n", false, true},
+		{"nix (Nix)\n", false, false},
+		{"nix (Nix) two\n", false, false},
+		{"", false, false},
+	} {
+		if older, ok := nixOlderThan(c.version, 2, 31); older != c.older || ok != c.ok {
+			t.Errorf("nixOlderThan(%q, 2, 31) = %v, %v, want %v, %v", c.version, older, ok, c.older, c.ok)
+		}
+	}
+}
+
 // TestCAAgainstNix asks the nix on PATH, read-only, about the content
 // addresses of TestParseCA: a binary cache of narinfos in a directory of
 // the test's own, and Nix's cache of what it read there in another.
+//
+// The lists are what Nix 2.35.4 does. A Nix before 2.31 refuses git
+// hashing with SHA-256, which is among what Parse takes, and so is not
+// asked.
 func TestCAAgainstNix(t *testing.T) {
 	if _, err := exec.LookPath("nix"); err != nil {
 		t.Skip("nix is not on PATH")
+	}
+	version, err := exec.Command("nix", "--version").Output()
+	switch older, ok := nixOlderThan(string(version), 2, 31); {
+	case err != nil || !ok:
+		t.Skipf("this nix does not say which version it is: %v\n%s", err, version)
+	case older:
+		t.Skipf("this nix is older than 2.31, and the forms it is asked about are those of Nix 2.35: %s", version)
 	}
 	cache, home := t.TempDir(), t.TempDir()
 	if err := os.WriteFile(filepath.Join(cache, "nix-cache-info"), []byte("StoreDir: "+StoreDir+"\n"), 0o644); err != nil {
