@@ -9,6 +9,7 @@ require (
 	github.com/tmc/go-iroh v0.3.0
 	github.com/ulikunitz/xz v0.5.17
 	github.com/urfave/cli/v2 v2.27.7
+	github.com/xi2/xz v0.0.0-20171230120015-48954b6210f8
 	golang.org/x/sys v0.47.0
 )
 

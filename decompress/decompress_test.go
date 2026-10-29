@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"os/exec"
+	"runtime"
 	"testing"
 	"testing/iotest"
 
@@ -300,6 +301,88 @@ func TestCutShortAndCorrupt(t *testing.T) {
 				t.Error("bytes after the stream were read without an error")
 			}
 		})
+	}
+}
+
+// Bodies of 19 and 25 bytes as the xz program wrote them when told the
+// dictionary to state: a stream states one for each of its blocks, and its
+// reader has to hold as much.
+const (
+	// xz --lzma2=dict=64MiB, the dictionary of xz -9.
+	xzDictionary64MiB = "/Td6WFoAAATm1rRGBMAXEyEBHAAAAAAAAAAAAJ35zMkBABJhIE5BUiB3b3VsZCBiZSBoZXJlAACPKcuinFM2xgABMxPFkVNQH7bzfQEAAAAABFla"
+	// xz --lzma2=dict=65MiB, which the format rounds up to 96 MiB.
+	xzDictionary96MiB = "/Td6WFoAAATm1rRGBMAXEyEBHQAAAAAAAAAAAKOSDiYBABJhIE5BUiB3b3VsZCBiZSBoZXJlAACPKcuinFM2xgABMxPFkVNQH7bzfQEAAAAABFla"
+	// xz --lzma2=dict=1536MiB.
+	xzDictionary1536MiB = "/Td6WFoAAATm1rRGBMAXEyEBJQAAAAAAAAAAAG9QKl0BABJhIE5BUiB3b3VsZCBiZSBoZXJlAACPKcuinFM2xgABMxPFkVNQH7bzfQEAAAAABFla"
+	// xz --filters1=lzma2:dict=1MiB --filters2=lzma2:dict=1536MiB
+	// --block-list=1:12,2:0: one stream whose second block states the
+	// large dictionary.
+	xzSecondBlock1536MiB = "/Td6WFoAAATm1rRGBMAQDCEBEAAAAAAAAAAAADzASiUBAAtmaXJzdCBibG9jaywAk4z/X+yQvy0EwBENIQElAAAAAAAAAAAAs7EJ6wEADCBzZWNvbmQgYmxvY2sA" +
+		"AAAAhQ+wEuCxknMAAiwMLQ0AALwCox2xxGf7AgAAAAAEWVo="
+)
+
+func TestXzDictionaryLimit(t *testing.T) {
+	// The dictionary is memory the body makes its reader hold: 84 bytes can
+	// ask for gigabytes. What is above the largest that the xz program's
+	// presets write is refused, in whichever block or stream it stands.
+	fixture := func(s string) []byte {
+		t.Helper()
+		b, err := base64.StdEncoding.DecodeString(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	if got, compressed := read(t, bytes.NewReader(fixture(xzDictionary64MiB))); !compressed || string(got) != "a NAR would be here" {
+		t.Errorf("a dictionary of 64 MiB: read %q, compressed = %v", got, compressed)
+	}
+
+	for _, c := range []struct {
+		name string
+		body []byte
+	}{
+		{"96 MiB", fixture(xzDictionary96MiB)},
+		{"1536 MiB", fixture(xzDictionary1536MiB)},
+		{"1536 MiB in the second block", fixture(xzSecondBlock1536MiB)},
+		{"1536 MiB in the second stream", append(xzOf(t, smallNAR(t)), fixture(xzDictionary1536MiB)...)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			out, _, err := Reader(bytes.NewReader(c.body))
+			if err == nil {
+				_, err = io.ReadAll(out)
+			}
+			runtime.ReadMemStats(&after)
+			if err == nil || errors.Is(err, ErrUnsupported) {
+				t.Errorf("error %v, want a failed read", err)
+			}
+			// Refused before the memory is asked for, not after.
+			if grown := after.TotalAlloc - before.TotalAlloc; grown > maxXzDictionary {
+				t.Errorf("reading %d bytes allocated %d MiB", len(c.body), grown>>20)
+			}
+		})
+	}
+}
+
+func TestZstdWindowLimit(t *testing.T) {
+	// A frame of nine bytes: the magic number, a header that states the
+	// window and nothing else, and one last block that is empty.
+	frame := func(window byte) []byte {
+		return []byte{0x28, 0xb5, 0x2f, 0xfd, 0x00, window, 0x01, 0x00, 0x00}
+	}
+	// 2^27 bytes, the limit.
+	if got, compressed := read(t, bytes.NewReader(frame(0x88))); !compressed || len(got) != 0 {
+		t.Errorf("a window of 128 MiB: read %d bytes, compressed = %v", len(got), compressed)
+	}
+	// 2^28 bytes, which the decoder would read if it were left to its own
+	// limit.
+	out, _, err := Reader(bytes.NewReader(frame(0x90)))
+	if err == nil {
+		_, err = io.ReadAll(out)
+	}
+	if err == nil || errors.Is(err, ErrUnsupported) {
+		t.Errorf("a window of 256 MiB: error %v, want a failed read", err)
 	}
 }
 

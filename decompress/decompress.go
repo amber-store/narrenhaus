@@ -13,7 +13,7 @@ import (
 
 	"github.com/klauspost/compress/gzip"
 	"github.com/klauspost/compress/zstd"
-	"github.com/ulikunitz/xz"
+	"github.com/xi2/xz"
 )
 
 // ErrUnsupported is returned by Reader for a body that begins like none of
@@ -40,6 +40,12 @@ const (
 	// the zstd program itself reads without being told to read more. The
 	// window is memory the frame makes its reader hold.
 	maxZstdWindow = 128 << 20
+
+	// maxXzDictionary is the largest dictionary a block of an xz stream
+	// may state: that of xz -9, the largest the xz program's presets, and
+	// so Nix, write. The dictionary is memory the block makes its reader
+	// hold, up to 4 GiB of it.
+	maxXzDictionary = 64 << 20
 )
 
 // Reader recognises r's compression by its first bytes (xz, zstd, gzip,
@@ -51,8 +57,10 @@ const (
 // met while looking at its first bytes is returned as it is. A compressed
 // body that is cut short, is not what its first bytes promise, or is
 // followed by bytes that are no further stream fails when out is read,
-// with the decompressor's error. Streams of one kind that follow one
-// another are read as one, as the programs of those formats read them.
+// with the decompressor's error. So does one that asks its reader for
+// more memory than a body of Nix's does: an xz dictionary above 64 MiB, a
+// zstd window above 128 MiB. Streams of one kind that follow one another
+// are read as one, as the programs of those formats read them.
 //
 // out reads from r through a buffer and may have read more of r than it
 // has given out. It holds nothing that has to be closed.
@@ -63,7 +71,9 @@ func Reader(r io.Reader) (out io.Reader, compressed bool, err error) {
 	head, peekErr := br.Peek(len(magicNAR))
 	switch {
 	case bytes.HasPrefix(head, magicXz):
-		x, err := xz.NewReader(br)
+		// This decoder takes a limit on the dictionary and holds every
+		// block of every stream to it.
+		x, err := xz.NewReader(br, maxXzDictionary)
 		if err != nil {
 			return nil, false, fmt.Errorf("decompress: xz: %w", err)
 		}
