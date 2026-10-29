@@ -44,6 +44,12 @@ import (
 // testPrefix is the one prefix both instances use.
 const testPrefix = "acme/"
 
+// repeatAfter is how long an instance waits for the answer to a lookup on
+// a connection that was up before it repeats the lookup on a fresh one.
+// The command's is three seconds; the test of the silent connection waits
+// for it.
+const repeatAfter = 300 * time.Millisecond
+
 // logBuffer keeps what an instance logs. A test that fails prints it, and
 // so does every test when NARRENHAUS_TEST_LOG is set.
 type logBuffer struct {
@@ -136,7 +142,8 @@ func start(t *testing.T, opts testserver.Options) *harness {
 }
 
 // instance starts a narrenhaus with a cache directory, a signing key and a
-// connection of its own, and the time limits the command runs with.
+// connection of its own, and the time limits the command runs with, but
+// for repeatAfter.
 func (h *harness) instance(name string) *instance {
 	h.t.Helper()
 	t := h.t
@@ -153,7 +160,7 @@ func (h *harness) instance(name string) *instance {
 		t.Fatalf("instance %s: %v", name, err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	rem := remote.New(remote.Config{Dial: h.srv.Dial(), Log: log})
+	rem := remote.New(remote.Config{Dial: h.srv.Dial(), RepeatAfter: repeatAfter, Log: log})
 	i.store = refs.New(ctx, i.cache, rem, refs.Options{Prefix: testPrefix, Log: log})
 	i.up = upload.New(ctx, i.cache, rem, i.store, upload.Options{Log: log})
 	ts := httptest.NewServer(httpd.New(httpd.Config{

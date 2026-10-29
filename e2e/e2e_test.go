@@ -225,7 +225,8 @@ func TestConnectionKilledBetweenRequests(t *testing.T) {
 	h.b.narinfoOf(one)
 	// The server closes every connection and tells its clients so, as one
 	// that is stopped in good order does. A connection lost without a
-	// word, as while the laptop sleeps, is another case, and not this one.
+	// word, as while the laptop sleeps, is another case:
+	// TestConnectionLostWithoutAWord.
 	h.srv.DropConnections()
 	// The next request is for a path b has nothing of: only the server
 	// can have answered it.
@@ -238,6 +239,38 @@ func TestConnectionKilledBetweenRequests(t *testing.T) {
 	three := pathOf(t, "three-1.0", tree(3, 10<<10))
 	h.a.copy(three)
 	h.srv.DropConnections()
+	h.b.substitute(three)
+}
+
+// The server loses its connections without a word to its clients, as one
+// does whose idle timeout ran out while the laptop slept. The client's
+// side of such a connection takes requests, and nothing comes back: an
+// instance that waited on it for the whole limit of a lookup would answer
+// Nix that the path is not there.
+func TestConnectionLostWithoutAWord(t *testing.T) {
+	h := start(t, testserver.Options{})
+	one := pathOf(t, "one-1.0", tree(1, 10<<10))
+	two := pathOf(t, "two-1.0", tree(2, 10<<10))
+	h.a.copy(one, two)
+	h.a.settled()
+
+	// b has a connection, and loses it.
+	h.b.narinfoOf(one)
+	h.srv.Forget()
+	// The next request is for a path b has nothing of: only the server
+	// can have answered it, and it answered on a connection dialled after
+	// the old one had been silent for repeatAfter.
+	began := time.Now()
+	h.b.narinfoOf(two)
+	if took := time.Since(began); took < repeatAfter || took > 5*time.Second {
+		t.Errorf("b answered after %s, want after the %s it waits on a silent connection and well within the 10s of a lookup", took, repeatAfter)
+	}
+	h.b.substitute(two)
+
+	// The uploading side has such a connection too, and recovers the
+	// same way.
+	three := pathOf(t, "three-1.0", tree(3, 10<<10))
+	h.a.copy(three)
 	h.b.substitute(three)
 }
 
