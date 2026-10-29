@@ -310,7 +310,7 @@ func ingestArchive(t *testing.T, archive []byte) ingested {
 	t.Helper()
 	in := ingested{store: newObjects()}
 	var err error
-	in.node, in.narHash, in.narSize, err = Ingest(bytes.NewReader(archive), in.store.emit)
+	in.node, in.narHash, in.narSize, err = Ingest(bytes.NewReader(archive), in.store.emit, MaxNARSize)
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -902,13 +902,13 @@ func TestIngestIsStreaming(t *testing.T) {
 	runtime.ReadMemStats(&before)
 
 	// Once with an emit that keeps nothing.
-	_, _, _, err := Ingest(fileArchive(newNoise(64), size), discard)
+	_, _, _, err := Ingest(fileArchive(newNoise(64), size), discard, MaxNARSize)
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
 	// Once with one that writes the objects to a file.
 	sent := sha256.New()
-	node, narHash, narSize, err := Ingest(io.TeeReader(fileArchive(newNoise(64), size), sent), store.emit)
+	node, narHash, narSize, err := Ingest(io.TeeReader(fileArchive(newNoise(64), size), sent), store.emit, MaxNARSize)
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -962,7 +962,7 @@ func TestSameNARSameRoot(t *testing.T) {
 		}
 		// The sizes of the reads decide nothing.
 		o := newObjects()
-		node, narHash, narSize, err := Ingest(iotest.OneByteReader(bytes.NewReader(archive)), o.emit)
+		node, narHash, narSize, err := Ingest(iotest.OneByteReader(bytes.NewReader(archive)), o.emit, MaxNARSize)
 		if err != nil {
 			t.Fatalf("%s: Ingest byte by byte: %v", tc.name, err)
 		}
@@ -1021,7 +1021,7 @@ func TestFileAsCoreIngests(t *testing.T) {
 		}
 
 		o = newObjects()
-		node, _, _, err := Ingest(fileArchive(bytes.NewReader(body), int64(size)), o.emit)
+		node, _, _, err := Ingest(fileArchive(bytes.NewReader(body), int64(size)), o.emit, MaxNARSize)
 		if err != nil {
 			t.Fatalf("%d bytes: Ingest: %v", size, err)
 		}
@@ -1094,7 +1094,7 @@ func TestIngestRefusesAMalformedArchive(t *testing.T) {
 			step = 4099
 		}
 		for n := 0; n < len(whole); n += step {
-			node, narHash, narSize, err := Ingest(bytes.NewReader(whole[:n]), newObjects().emit)
+			node, narHash, narSize, err := Ingest(bytes.NewReader(whole[:n]), newObjects().emit, MaxNARSize)
 			if !errors.Is(err, nar.ErrMalformed) {
 				t.Fatalf("%s cut to %d of %d bytes: %v, want an error wrapping nar.ErrMalformed", name, n, len(whole), err)
 			}
@@ -1102,13 +1102,13 @@ func TestIngestRefusesAMalformedArchive(t *testing.T) {
 				t.Fatalf("%s cut to %d bytes: Ingest failed and returned a node, a hash or a size", name, n)
 			}
 		}
-		if _, _, _, err := Ingest(bytes.NewReader(append(bytes.Clone(whole), 0)), newObjects().emit); !errors.Is(err, nar.ErrMalformed) {
+		if _, _, _, err := Ingest(bytes.NewReader(append(bytes.Clone(whole), 0)), newObjects().emit, MaxNARSize); !errors.Is(err, nar.ErrMalformed) {
 			t.Fatalf("%s with a byte after it: %v, want an error wrapping nar.ErrMalformed", name, err)
 		}
 	}
 	// Names out of order: the parser's rule, seen through Ingest.
 	unsorted := bytes.Replace(write(t, []event{dir(""), file("a", ""), file("b", ""), leave()}), narString("a"), narString("c"), 1)
-	if _, _, _, err := Ingest(bytes.NewReader(unsorted), newObjects().emit); !errors.Is(err, nar.ErrMalformed) {
+	if _, _, _, err := Ingest(bytes.NewReader(unsorted), newObjects().emit, MaxNARSize); !errors.Is(err, nar.ErrMalformed) {
 		t.Fatalf("names out of order: %v, want an error wrapping nar.ErrMalformed", err)
 	}
 }
@@ -1137,7 +1137,7 @@ func TestIngestReturnsOtherErrorsAsTheyAre(t *testing.T) {
 			}
 			return nil
 		}
-		_, _, _, err := Ingest(bytes.NewReader(archive), emit)
+		_, _, _, err := Ingest(bytes.NewReader(archive), emit, MaxNARSize)
 		switch {
 		case err == sentinel:
 			failures++
@@ -1153,7 +1153,7 @@ func TestIngestReturnsOtherErrorsAsTheyAre(t *testing.T) {
 	for _, cause := range []error{errors.New("connection reset"), io.ErrUnexpectedEOF} {
 		for _, at := range []int{0, 50, 200, 100_000, len(archive) - 1} {
 			r := &failing{bytes.NewReader(archive[:at]), cause}
-			_, _, _, err := Ingest(r, newObjects().emit)
+			_, _, _, err := Ingest(r, newObjects().emit, MaxNARSize)
 			if err != cause {
 				t.Errorf("the reader failing after %d bytes: Ingest: %v, want %v as it is", at, err, cause)
 			}
@@ -1483,14 +1483,14 @@ func TestIngestRefusesAnArchiveThatIsTooLarge(t *testing.T) {
 	archive := write(t, []event{dir(""), file("a", "small"), file("big", string(noiseBytes(5, 300_000))), link("z", "big"), leave()})
 	size := uint64(len(archive))
 
-	node, narHash, narSize, err := ingestUpTo(bytes.NewReader(archive), newObjects().emit, size)
+	node, narHash, narSize, err := Ingest(bytes.NewReader(archive), newObjects().emit, size)
 	if err != nil || narSize != size || narHash != sha256.Sum256(archive) || string(node.Name) != "nar" {
 		t.Fatalf("an archive of the limit's length: size %d, hash %x, node %q, %v", narSize, narHash, node.Name, err)
 	}
 	for _, limit := range []uint64{size - 1, size / 2, 100, 0} {
 		// The reader has no end: what stops the reading is the limit.
 		read := &counted{r: io.MultiReader(bytes.NewReader(archive), newNoise(1))}
-		node, narHash, narSize, err := ingestUpTo(read, newObjects().emit, limit)
+		node, narHash, narSize, err := Ingest(read, newObjects().emit, limit)
 		if !errors.Is(err, ErrTooLarge) || errors.Is(err, nar.ErrMalformed) {
 			t.Fatalf("limit %d: %v, want ErrTooLarge", limit, err)
 		}
@@ -1505,7 +1505,7 @@ func TestIngestRefusesAnArchiveThatIsTooLarge(t *testing.T) {
 	}
 	// A reader's error at the limit is not the archive's being too large.
 	cause := errors.New("connection reset")
-	if _, _, _, err := ingestUpTo(&failing{bytes.NewReader(archive[:100]), cause}, newObjects().emit, 100); err != cause {
+	if _, _, _, err := Ingest(&failing{bytes.NewReader(archive[:100]), cause}, newObjects().emit, 100); err != cause {
 		t.Errorf("the reader failing at the limit: %v, want %v as it is", err, cause)
 	}
 }

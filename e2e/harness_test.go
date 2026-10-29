@@ -493,7 +493,7 @@ func pathOf(t *testing.T, seed string, n node, references ...*storePath) *storeP
 	t.Helper()
 	p := &storePath{hash: storeHash(seed), name: seed, archive: archive(t, n)}
 	objs := newObjects()
-	node, sum, size, err := nartree.Ingest(bytes.NewReader(p.archive), objs.emit)
+	node, sum, size, err := nartree.Ingest(bytes.NewReader(p.archive), objs.emit, nartree.MaxNARSize)
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}

@@ -57,7 +57,9 @@ func (c *Cache) newWriter(sub string) (*Writer, error) {
 }
 
 // Add appends the object data under k. A key already added is skipped: its
-// bytes are in the file once.
+// bytes are in the file once. An object beyond what a pack may hold is
+// refused with an error that wraps ErrLimit, and the writer is as it was;
+// after a write that failed, every Add fails with that error.
 func (w *Writer) Add(k key.Key, data []byte) error {
 	if w.done {
 		return errors.New("packcache: add to a writer that was sealed or discarded")
@@ -69,13 +71,13 @@ func (w *Writer) Add(k key.Key, data []byte) error {
 		return nil
 	}
 	if err := k.Validate(); err != nil {
-		return fmt.Errorf("packcache: key %s is not canonical: %w", k, err)
+		return fmt.Errorf("%w: key %s is not canonical: %w", ErrLimit, k, err)
 	}
 	if len(data) > amberpack.MaxPayload {
-		return fmt.Errorf("packcache: object %s of %d bytes is above the limit of %d", k, len(data), amberpack.MaxPayload)
+		return fmt.Errorf("%w: object %s of %d bytes is above the limit of %d", ErrLimit, k, len(data), amberpack.MaxPayload)
 	}
 	if len(w.entries) >= packfile.MaxEntries {
-		return fmt.Errorf("packcache: more than %d objects in one file", packfile.MaxEntries)
+		return fmt.Errorf("%w: more than %d objects in one file", ErrLimit, packfile.MaxEntries)
 	}
 	if _, err := w.buf.Write(data); err != nil {
 		w.err = fmt.Errorf("packcache: %w", err)

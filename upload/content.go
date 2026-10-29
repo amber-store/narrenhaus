@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"net/http"
 	"time"
 
@@ -147,10 +146,8 @@ func (u *Uploader) stage(urlHash string, body io.Reader) (*stagedNAR, error) {
 
 	// What ends the staging from this side is told apart from a NAR that
 	// is malformed by being noted here: Ingest returns either as it got
-	// it. objects counts what the file took, an object that came again
-	// included.
+	// it.
 	var stop *Error
-	objects := 0
 	emit := func(o fstree.Object) error {
 		if u.ctx.Err() != nil {
 			// Nothing more is read or written for an uploader that is
@@ -165,16 +162,17 @@ func (u *Uploader) stage(urlHash string, body io.Reader) (*stagedNAR, error) {
 			}
 		}
 		if err := w.Add(o.Key, o.Bytes); err != nil {
-			stop = u.notStaged(err, o, objects)
+			stop = u.notStaged(err, o)
 			return stop
 		}
-		objects++
 		return nil
 	}
-	node, sum, size, err := nartree.Ingest(in, emit)
+	node, sum, size, err := nartree.Ingest(in, emit, u.maxNAR)
 	switch {
 	case stop != nil:
 		return nil, stop
+	case errors.Is(err, nartree.ErrTooLarge):
+		return nil, u.tooLarge(err)
 	case errors.Is(err, nar.ErrMalformed):
 		return nil, failf(http.StatusBadRequest, err, "the body is no NAR as Nix writes one: %v", err)
 	case err != nil:
@@ -207,11 +205,10 @@ func (u *Uploader) stage(urlHash string, body io.Reader) (*stagedNAR, error) {
 }
 
 // notStaged is the answer when the staged file did not take the object o
-// and said err, after it had taken objects others: 507 for a write that
-// failed, and 422 when it is the file that takes no such object or no
-// more of them, which no repeat cures.
-func (u *Uploader) notStaged(err error, o fstree.Object, objects int) *Error {
-	limit := beyond(err, o, objects)
+// and said err: 507 for a write that failed, and 422 when it is the file
+// that takes no such object or no more of them, which no repeat cures.
+func (u *Uploader) notStaged(err error, o fstree.Object) *Error {
+	limit := beyond(err, o)
 	if limit == "" {
 		return u.unwritable(err)
 	}
@@ -220,22 +217,30 @@ func (u *Uploader) notStaged(err error, o fstree.Object, objects int) *Error {
 }
 
 // beyond names the limit of a staged file that the object o ran into when
-// the file refused it with err, after objects others; "" when err is a
-// write that failed. The cache has no error of its own for its limits, so
-// they are looked for here: in the object, and in the count together with
-// err not being what the operating system says of a write. The count takes
-// an object that came again for a new one, so it is never too low.
-func beyond(err error, o fstree.Object, objects int) string {
-	var system *fs.PathError
+// the file refused it with err; "" when err is a write that failed. The
+// cache says which of the two it is, with packcache.ErrLimit; which limit
+// it is shows in the object, and where it does not, the file is full.
+func beyond(err error, o fstree.Object) string {
 	switch {
+	case !errors.Is(err, packcache.ErrLimit):
+		return ""
 	case len(o.Bytes) > amberpack.MaxPayload:
 		return fmt.Sprintf("one of its objects has %d bytes, and a pack takes none above %d", len(o.Bytes), amberpack.MaxPayload)
 	case o.Key.Validate() != nil:
 		return fmt.Sprintf("the key %s of one of its objects is not canonical; this is a defect of narrenhaus", o.Key)
-	case objects >= packfile.MaxEntries && !errors.As(err, &system):
-		return fmt.Sprintf("it makes more than the %d objects a pack holds", packfile.MaxEntries)
 	}
-	return ""
+	return fmt.Sprintf("it makes more than the %d objects a pack holds", packfile.MaxEntries)
+}
+
+// tooLarge is the answer to a NAR of more bytes than narrenhaus takes,
+// which Ingest refused with err.
+func (u *Uploader) tooLarge(err error) *Error {
+	limit := fmt.Sprintf("%d bytes", u.maxNAR)
+	if u.maxNAR > 0 && u.maxNAR%(1<<30) == 0 {
+		limit = fmt.Sprintf("%d GiB (%s)", u.maxNAR>>30, limit)
+	}
+	u.log.Warn("a NAR is longer than narrenhaus takes; the upload is refused", "limit", limit)
+	return failf(http.StatusUnprocessableEntity, err, "narrenhaus takes no NAR of more than %s, and this one is longer", limit)
 }
 
 // unwritable is the answer when the staging directory did not take what

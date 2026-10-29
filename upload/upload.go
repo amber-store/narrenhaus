@@ -36,6 +36,7 @@ import (
 	"github.com/amber-store/core/fstree"
 	"github.com/amber-store/core/key"
 
+	"github.com/amber-store/narrenhaus/nartree"
 	"github.com/amber-store/narrenhaus/nix32"
 	"github.com/amber-store/narrenhaus/packcache"
 	"github.com/amber-store/narrenhaus/refs"
@@ -121,6 +122,9 @@ type Uploader struct {
 	contentPushes int
 	minDedup      float64
 	idleExpiry    time.Duration
+	// maxNAR is the most bytes of a NAR that is taken:
+	// nartree.MaxNARSize, which only tests lower.
+	maxNAR uint64
 	// narinfoPlaces are the places of the narinfo pushes that may run at
 	// once.
 	narinfoPlaces chan struct{}
@@ -160,6 +164,7 @@ func New(ctx context.Context, cache *packcache.Cache, rem *remote.Remote, store 
 		contentPushes: opts.ContentPushes,
 		minDedup:      opts.MinDedup,
 		idleExpiry:    opts.IdleExpiry,
+		maxNAR:        nartree.MaxNARSize,
 		entries:       make(map[string]*work),
 		narinfos:      make(map[string]*flight),
 		idleSince:     time.Now(),

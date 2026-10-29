@@ -77,6 +77,11 @@ var (
 	// ErrAbsent is returned, wrapped, by Get for a key that is in none of
 	// the files asked.
 	ErrAbsent = errors.New("packcache: no such object")
+	// ErrLimit is returned, wrapped, by Writer.Add for an object the file
+	// does not take because of what a pack may hold: a key that is not
+	// canonical, an object above amberpack.MaxPayload, and one object more
+	// than packfile.MaxEntries. Unlike a failed write, no repeat cures it.
+	ErrLimit = errors.New("packcache: beyond the limits of a pack")
 
 	errClosed = errors.New("packcache: the cache is closed")
 )

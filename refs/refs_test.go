@@ -311,7 +311,7 @@ func ingested(t *testing.T, archive []byte) *reference {
 	t.Helper()
 	r := &reference{archive: archive, objs: newObjects()}
 	var err error
-	r.node, r.sum, r.size, err = nartree.Ingest(bytes.NewReader(archive), r.objs.emit)
+	r.node, r.sum, r.size, err = nartree.Ingest(bytes.NewReader(archive), r.objs.emit, nartree.MaxNARSize)
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}

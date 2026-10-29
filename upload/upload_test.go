@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -333,7 +334,7 @@ func storeHash(seed string) string {
 func pathOf(t *testing.T, seed string, n node) *storePath {
 	t.Helper()
 	p := &storePath{hash: storeHash(seed), name: seed, archive: archive(t, n), objs: newObjects()}
-	node, sum, size, err := nartree.Ingest(bytes.NewReader(p.archive), p.objs.emit)
+	node, sum, size, err := nartree.Ingest(bytes.NewReader(p.archive), p.objs.emit, nartree.MaxNARSize)
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -1880,7 +1881,7 @@ func TestReproduce(t *testing.T) {
 	defect("another size received", f.up.reproduce(f.sealed(p.objs), p.root, p.sum, p.size+8))
 
 	// The tree is not the one of the NAR its recipe states.
-	node, _, _, err := nartree.Ingest(bytes.NewReader(p.archive), func(fstree.Object) error { return nil })
+	node, _, _, err := nartree.Ingest(bytes.NewReader(p.archive), func(fstree.Object) error { return nil }, nartree.MaxNARSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1965,32 +1966,32 @@ func TestALimitOfStagingIsNoFailedWrite(t *testing.T) {
 	}
 	f.up.tamper = nil
 
-	// The three limits, and what is none of them.
+	// The three limits, and what is none of them: the cache says which
+	// refusal is a limit, and the object which limit it is.
 	small := fstree.Object{Key: p.root, Bytes: []byte("an object")}
-	refusal := errors.New("packcache: the file takes no more")
+	limit := fmt.Errorf("%w: the file takes no such object", packcache.ErrLimit)
 	diskFull := fmt.Errorf("packcache: %w", &fs.PathError{Op: "write", Path: "staging/1.data", Err: syscall.ENOSPC})
 	huge := fstree.Object{Key: p.root, Bytes: make([]byte, amberpack.MaxPayload+1)}
 	bad := small
 	bad.Key[key.Size-1] |= 0x08
 	for _, c := range []struct {
-		name    string
-		err     error
-		o       fstree.Object
-		objects int
-		want    string // part of the limit's name, "" for a failed write
+		name string
+		err  error
+		o    fstree.Object
+		want string // part of the limit's name, "" for a failed write
 	}{
-		{"an object above the payload limit", refusal, huge, 3, fmt.Sprint(amberpack.MaxPayload)},
-		{"a key that is not canonical", refusal, bad, 3, "not canonical"},
-		{"one object more than a pack holds", refusal, small, packfile.MaxEntries, fmt.Sprint(packfile.MaxEntries)},
-		{"a full disk", diskFull, small, 3, ""},
-		{"a full disk after as many objects as a pack holds", diskFull, small, packfile.MaxEntries + 5, ""},
-		{"another refusal before the pack is full", refusal, small, packfile.MaxEntries - 1, ""},
+		{"an object above the payload limit", limit, huge, fmt.Sprint(amberpack.MaxPayload)},
+		{"a key that is not canonical", limit, bad, "not canonical"},
+		{"one object more than a pack holds", limit, small, fmt.Sprint(packfile.MaxEntries)},
+		{"a full disk", diskFull, small, ""},
+		{"a write that failed and is no error of the system", io.ErrShortWrite, small, ""},
+		{"a failed write of an object above the payload limit", diskFull, huge, ""},
 	} {
-		got := beyond(c.err, c.o, c.objects)
+		got := beyond(c.err, c.o)
 		if (got == "") != (c.want == "") || !strings.Contains(got, c.want) {
 			t.Errorf("%s: the limit is %q, want one that names %q", c.name, got, c.want)
 		}
-		e := f.up.notStaged(c.err, c.o, c.objects)
+		e := f.up.notStaged(c.err, c.o)
 		want := http.StatusUnprocessableEntity
 		if c.want == "" {
 			want = http.StatusInsufficientStorage
@@ -2182,6 +2183,84 @@ func TestABodyThatAsksForTooMuchMemory(t *testing.T) {
 	f.nothingStaged()
 }
 
+// endlessNAR is the archive of one file that states 1 TiB and whose bytes
+// never end, with the count of the bytes read of it.
+func endlessNAR() (io.Reader, *atomic.Int64) {
+	var head []byte
+	for _, s := range []string{"nix-archive-1", "(", "type", "regular", "contents"} {
+		head = binary.LittleEndian.AppendUint64(head, uint64(len(s)))
+		head = append(head, s...)
+		head = append(head, make([]byte, -len(s)&7)...)
+	}
+	head = binary.LittleEndian.AppendUint64(head, 1<<40)
+	zeroes := readerFunc(func(p []byte) (int, error) {
+		clear(p)
+		return len(p), nil
+	})
+	body := io.MultiReader(bytes.NewReader(head), zeroes)
+	var read atomic.Int64
+	return readerFunc(func(p []byte) (int, error) {
+		n, err := body.Read(p)
+		read.Add(int64(n))
+		return n, err
+	}), &read
+}
+
+func TestANARThatIsTooLarge(t *testing.T) {
+	// A NAR above the limit could be checked by no narrenhaus that fetches
+	// it (refs calls its recipe broken), so it is not taken either. A
+	// repeat cures nothing: 422. The limit is lowered here; that it is 64
+	// GiB is in TestDefaults.
+	f := newFixture(t, config{})
+	p := pathOf(t, "at-the-limit", dir(map[string]node{"a": file(noise(1, 1<<20)), "b": file(noise(2, 1<<20))}))
+	limit := uint64(len(p.archive))
+	refused := func(what, urlHash string, body io.Reader) *Error {
+		t.Helper()
+		err := f.up.PutNAR(background(t), urlHash, body)
+		e := wantStatus(t, what, err, http.StatusUnprocessableEntity)
+		if !errors.Is(e, nartree.ErrTooLarge) {
+			t.Errorf("%s: the answer does not wrap nartree.ErrTooLarge: %v", what, err)
+		}
+		if !strings.Contains(e.Msg, fmt.Sprintf("%d bytes", f.up.maxNAR)) {
+			t.Errorf("%s: the message does not name the limit of %d bytes: %s", what, f.up.maxNAR, e.Msg)
+		}
+		f.nothingStaged()
+		if _, _, ok := f.entry(p.narHash); ok {
+			t.Errorf("%s: a refused upload left an entry", what)
+		}
+		return e
+	}
+
+	f.up.maxNAR = limit - 1
+	refused("PutNAR of a NAR one byte above the limit", p.narHash, bytes.NewReader(p.archive))
+	// The limit is on the NAR, not on the body that carries it.
+	packed := zstdOf(t, p.archive)
+	refused("PutNAR of a compressed NAR above the limit", fileHash(packed), bytes.NewReader(packed))
+	if !f.log.has("level=WARN", "longer than narrenhaus takes") {
+		t.Error("the refusal is not in the log")
+	}
+
+	// The reading ends where the limit is passed, not where the NAR does:
+	// this one has no end.
+	body, read := endlessNAR()
+	refused("PutNAR of a NAR without end", p.narHash, body)
+	if n := read.Load(); n > int64(limit)+4<<20 {
+		t.Errorf("%d bytes were read of a NAR that may have %d", n, limit-1)
+	}
+
+	// A NAR of the limit's length is taken.
+	f.up.maxNAR = limit
+	f.upload(p)
+	f.settled()
+	f.nothingStaged()
+
+	// What the answer says of the limit the command runs with.
+	f.up.maxNAR = nartree.MaxNARSize
+	if e := f.up.tooLarge(nartree.ErrTooLarge); !strings.Contains(e.Msg, "64 GiB") {
+		t.Errorf("the message does not name the limit of 64 GiB: %s", e.Msg)
+	}
+}
+
 func TestDefaults(t *testing.T) {
 	// The limits the design fixes (spec 5 and 5.1). The command passes
 	// none of its own, so these are the ones it runs with.
@@ -2198,5 +2277,8 @@ func TestDefaults(t *testing.T) {
 	}
 	if u.idleExpiry != 15*time.Minute {
 		t.Errorf("staged NARs are deleted after %v idle, want 15 minutes", u.idleExpiry)
+	}
+	if u.maxNAR != 64<<30 {
+		t.Errorf("a NAR may have %d bytes, want 64 GiB", u.maxNAR)
 	}
 }

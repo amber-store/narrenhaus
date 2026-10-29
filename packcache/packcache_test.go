@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/amber-store/core/amberpack"
 	"github.com/amber-store/core/key"
 	"github.com/amber-store/jaccard-store/packfile"
 )
@@ -284,6 +285,87 @@ func TestWriterRefusesAKeyThatIsNotCanonical(t *testing.T) {
 	bad[key.Size-1] = 0xf0
 	if err := w.Add(bad, []byte("x")); err == nil {
 		t.Fatal("Add took a key of no defined type")
+	}
+}
+
+// TestWriterTellsALimitFromAFailedWrite checks that Add's three refusals
+// for what a pack may hold wrap ErrLimit, that a write that failed does
+// not, and that a refusal leaves the writer as it was.
+func TestWriterTellsALimitFromAFailedWrite(t *testing.T) {
+	dir := t.TempDir()
+	c := open(t, dir, roomy)
+	w, err := c.NewStaged()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Discard()
+	first, second := body("first", 100), body("second", 100)
+	if err := w.Add(blob(t, first), first); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	bad := blob(t, second)
+	bad[key.Size-1] |= 0x08 // a bit no key has set
+	if err := w.Add(bad, second); !errors.Is(err, ErrLimit) {
+		t.Errorf("Add of a key that is not canonical: %v, want ErrLimit", err)
+	}
+	// The bytes are not looked at before the length is: they cost nothing.
+	huge := make([]byte, amberpack.MaxPayload+1)
+	if err := w.Add(blob(t, second), huge); !errors.Is(err, ErrLimit) {
+		t.Errorf("Add of an object of %d bytes: %v, want ErrLimit", len(huge), err)
+	}
+
+	// None of the refusals ended the writing.
+	third := body("third", 100)
+	if err := w.Add(blob(t, third), third); err != nil {
+		t.Fatalf("Add after the refusals: %v", err)
+	}
+	s, err := w.Seal()
+	if err != nil {
+		t.Fatalf("Seal after the refusals: %v", err)
+	}
+	defer s.Discard()
+	wantObject(t, s, first)
+	wantObject(t, s, third)
+	wantAbsent(t, s, second)
+
+	// As many objects as a pack holds are too many to write here: the
+	// writer's table is made that long instead, and never read.
+	full, err := c.NewStaged()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer full.Discard()
+	if err := full.Add(blob(t, first), first); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	full.entries = make([]packfile.Entry, packfile.MaxEntries)
+	if err := full.Add(blob(t, third), third); !errors.Is(err, ErrLimit) {
+		t.Errorf("Add of object %d: %v, want ErrLimit", packfile.MaxEntries+1, err)
+	}
+	// One that came before is no new object.
+	if err := full.Add(blob(t, first), first); err != nil {
+		t.Errorf("Add to a full file of an object it has: %v", err)
+	}
+	full.entries = full.entries[:packfile.MaxEntries-1]
+	if err := full.Add(blob(t, third), third); err != nil {
+		t.Errorf("Add of object %d: %v", packfile.MaxEntries, err)
+	}
+
+	// A write that fails is no limit, and neither is anything after it.
+	failed, err := c.NewStaged()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer failed.Discard()
+	failed.f.Close()
+	large := body("large", 1<<20) // more than the writer buffers
+	err = failed.Add(blob(t, large), large)
+	if err == nil || errors.Is(err, ErrLimit) {
+		t.Errorf("Add to a file that cannot be written: %v, want an error that is not ErrLimit", err)
+	}
+	if again := failed.Add(bad, second); again != err {
+		t.Errorf("Add after a failed write: %v, want the failure again: %v", again, err)
 	}
 }
 

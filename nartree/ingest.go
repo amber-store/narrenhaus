@@ -59,11 +59,11 @@ const (
 
 // MaxNARSize is the longest archive narrenhaus takes, in bytes: 64 GiB.
 // It bounds what the check of a reference can cost, which is the hashing
-// of its archive: Ingest reads no more, and a reference whose recipe
-// states more is not rebuilt.
+// of its archive: it is the limit an upload gives to Ingest, and a
+// reference whose recipe states more is not rebuilt.
 const MaxNARSize = 64 << 30
 
-// ErrTooLarge is an archive of more than MaxNARSize bytes.
+// ErrTooLarge is an archive of more bytes than the limit given to Ingest.
 var ErrTooLarge = errors.New("nartree: the archive is too large")
 
 // Node is the NAR's root node as an entry named "nar".
@@ -79,23 +79,19 @@ func entry(name string, mode uint64) fstree.Entry {
 	return fstree.Entry{Name: []byte(name), Mode: mode, UID: 0, GID: 0, Mtime: mtime}
 }
 
-// Ingest reads one NAR from r, emits its objects and returns its root
-// node with the SHA-256 and length of the bytes read. Errors of the
-// archive wrap nar.ErrMalformed, or ErrTooLarge as soon as more than
-// MaxNARSize bytes of it were read; an error of r and an error of emit are
-// returned as they are. On an error the node, hash and length are zero.
+// Ingest reads one NAR of at most limit bytes from r, emits its objects
+// and returns its root node with the SHA-256 and length of the bytes read.
+// Errors of the archive wrap nar.ErrMalformed, or ErrTooLarge as soon as
+// more than limit bytes of it were read; an error of r and an error of
+// emit are returned as they are. On an error the node, hash and length are
+// zero. The limit of what narrenhaus takes is MaxNARSize.
 //
 // Objects are emitted children before parents, an object once for each
 // place it has in the tree, and each with bytes of its own, which emit
 // may keep. Memory in use does not grow with the archive: it is one chunk
 // of a file, the chunker's buffer, and the open directories' entries that
 // do not yet fill an object.
-func Ingest(r io.Reader, emit fstree.Emit) (node Node, narHash [32]byte, narSize uint64, err error) {
-	return ingestUpTo(r, emit, MaxNARSize)
-}
-
-// ingestUpTo is Ingest for an archive of at most limit bytes.
-func ingestUpTo(r io.Reader, emit fstree.Emit, limit uint64) (node Node, narHash [32]byte, narSize uint64, err error) {
+func Ingest(r io.Reader, emit fstree.Emit, limit uint64) (node Node, narHash [32]byte, narSize uint64, err error) {
 	read := &tally{r: r, sum: sha256.New(), limit: limit}
 	in := &ingester{emit: emit}
 	if err := nar.Parse(read, in); err != nil {
