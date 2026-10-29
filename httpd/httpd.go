@@ -96,8 +96,9 @@ type server struct {
 	log       *slog.Logger
 }
 
-// New returns the handler of the binary cache.
-func New(cfg Config) http.Handler {
+// newServer returns the handler's state for cfg, with the defaults in the
+// place of what cfg leaves out.
+func newServer(cfg Config) *server {
 	s := &server{
 		store: cfg.Store,
 		up:    cfg.Uploader,
@@ -114,6 +115,12 @@ func New(cfg Config) http.Handler {
 	if s.log == nil {
 		s.log = slog.Default()
 	}
+	return s
+}
+
+// New returns the handler of the binary cache.
+func New(cfg Config) http.Handler {
+	s := newServer(cfg)
 
 	// A GET pattern takes HEAD as well. The last two patterns take
 	// whatever the others leave, so the mux has no answer of its own.

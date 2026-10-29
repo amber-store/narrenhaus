@@ -1182,6 +1182,18 @@ func TestServeWaitAnswers404(t *testing.T) {
 	f.want(http.StatusOK, http.MethodGet, "/"+p.hash+".narinfo", nil)
 }
 
+// The wait the command runs with is the one a Config leaves out. Nix gives
+// a request up after 300 seconds of silence and counts that as an error;
+// the design answers 404 at 240.
+func TestServeWaitDefault(t *testing.T) {
+	if got := newServer(Config{}).wait; got != 240*time.Second {
+		t.Errorf("a request waits %v for its reference, want 240s", got)
+	}
+	if got := newServer(Config{ServeWait: time.Second}).wait; got != time.Second {
+		t.Errorf("a request waits %v for its reference, want the 1s of the Config", got)
+	}
+}
+
 func TestNamed(t *testing.T) {
 	s := &server{host: "build.example"}
 	for _, host := range []string{
