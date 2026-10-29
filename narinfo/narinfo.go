@@ -63,8 +63,10 @@ type Info struct {
 // "Key: value" ended by a line feed. StorePath, NarHash and NarSize are
 // required and NarSize is not zero; StorePath, the references and the
 // deriver must be store path names as Nix allows them; a signature must be
-// a name and the base 64 of 64 bytes; a second References or CA line is an
-// error. Of another key given twice the last one counts, as for Nix.
+// a name and the base 64 of 64 bytes; a content address must be one Nix
+// reads and can check a path with (see checkCA and checkCAReferences); a
+// second References or CA line is an error. Of another key given twice
+// the last one counts, as for Nix.
 // Errors wrap ErrMalformed and are one short line whatever the input.
 func Parse(b []byte) (*Info, error) {
 	info := &Info{}
@@ -141,7 +143,29 @@ func Parse(b []byte) (*Info, error) {
 	case info.NarSize == 0:
 		return nil, malformed("NarSize is missing or zero")
 	}
+	if err := info.checkCAReferences(); err != nil {
+		return nil, malformed("%v", err)
+	}
 	return info, nil
+}
+
+// checkCAReferences checks the references against the content address,
+// which checkCA has passed. Nix reads a narinfo whose path refers to what
+// a path of its kind cannot, and then fails when it checks the path's
+// signatures: a text refers to other paths only (Nix stops on a failed
+// assertion otherwise), a NAR hashed with SHA-256 to any, itself
+// included, and whatever else is fixed to none.
+func (i *Info) checkCAReferences() error {
+	switch {
+	case i.CA == "", strings.HasPrefix(i.CA, "fixed:r:sha256:"):
+	case strings.HasPrefix(i.CA, "text:"):
+		if slices.Contains(i.References, strings.TrimPrefix(i.StorePath, StoreDir+"/")) {
+			return errors.New("a text content address, and the path itself among the references")
+		}
+	case len(i.References) > 0:
+		return errors.New("references, and a content address that allows none (only text: and fixed:r:sha256: do)")
+	}
+	return nil
 }
 
 // malformed returns an error wrapping ErrMalformed.
@@ -301,16 +325,69 @@ func checkSig(s string) error {
 	return nil
 }
 
-// checkCA checks that a content address is printable ASCII without
-// spaces, which every form Nix knows is. Its meaning is left to Nix, whose
-// versions know different forms.
+// hashSizes are the hash algorithms of a content address, with the bytes
+// of their digests.
+var hashSizes = map[string]int{"md5": 16, "sha1": 20, "sha256": 32, "sha512": 64, "blake3": 32}
+
+// checkCA checks that s is a content address as Nix 2.35 reads one:
+//
+//	text:sha256:<digest>
+//	fixed:[r:|git:]<algorithm>:<digest>
+//
+// with the algorithm one of hashSizes and the digest in base 16, Nix's
+// base 32 or base 64, which its length tells apart. An empty value is no
+// content address, as for Nix. Any other value makes Nix refuse the whole
+// narinfo. Two kinds Nix reads are refused as well, because it fails over
+// them when it checks the path's signatures: a text address of another
+// algorithm than SHA-256 (a failed assertion) and a git address of another
+// than SHA-1 or SHA-256 (an error). git: and blake3 are read by a Nix
+// whose experimental features git-hashing and blake3-hashes are on, and
+// written by no other.
 func checkCA(s string) error {
-	for i := range len(s) {
-		if s[i] <= ' ' || s[i] > '~' {
-			return fmt.Errorf("%s is not a content address", clip(s))
+	if s == "" {
+		return nil
+	}
+	rest, text := strings.CutPrefix(s, "text:")
+	git := false
+	if !text {
+		var fixed bool
+		if rest, fixed = strings.CutPrefix(s, "fixed:"); !fixed {
+			return fmt.Errorf("%s is not a content address (text:... or fixed:...)", clip(s))
+		}
+		// How the file was hashed: as it is, as a NAR (r:), or as git
+		// hashes a tree.
+		if after, ok := strings.CutPrefix(rest, "r:"); ok {
+			rest = after
+		} else {
+			rest, git = strings.CutPrefix(rest, "git:")
 		}
 	}
+	algorithm, digest, _ := strings.Cut(rest, ":")
+	size, known := hashSizes[algorithm]
+	switch {
+	case !known, text && algorithm != "sha256", git && algorithm != "sha1" && algorithm != "sha256":
+		return fmt.Errorf("%s is not a content address: no hash algorithm it may have is named", clip(s))
+	case !isDigest(digest, size):
+		return fmt.Errorf("%s is not a content address: no %s digest follows", clip(s), algorithm)
+	}
 	return nil
+}
+
+// isDigest reports whether s is a digest of size bytes in base 16, Nix's
+// base 32 or base 64.
+func isDigest(s string, size int) bool {
+	var err error
+	switch len(s) {
+	case hex.EncodedLen(size):
+		_, err = hex.DecodeString(s)
+	case nix32.EncodedLen(size):
+		_, err = nix32.Decode(s)
+	case base64.StdEncoding.EncodedLen(size):
+		_, err = decodeBase64(s, size)
+	default:
+		return false
+	}
+	return err == nil
 }
 
 // HashPart returns the 32 characters before the first '-' of the store

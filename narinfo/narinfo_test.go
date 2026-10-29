@@ -2,13 +2,20 @@ package narinfo
 
 import (
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/amber-store/narrenhaus/nix32"
 )
 
 // nixWrote is a narinfo as cache.nixos.org serves it: an xz URL, two
@@ -262,7 +269,7 @@ func TestStoredParsesBackEqual(t *testing.T) {
 			"Deriver: "+pathC+".drv",
 			"Sig: "+sigNamed("alpha-1", 2),
 			"Sig: "+sigNamed("zeta-1", 1),
-			"CA: text:sha256:"+narHashNix32,
+			"CA: fixed:r:sha256:"+narHashNix32,
 			"System: x86_64-linux",
 		),
 	} {
@@ -518,6 +525,267 @@ func TestParseAccepts(t *testing.T) {
 	}
 	if stored := string(info.Stored()); strings.Contains(stored, "CA") {
 		t.Errorf("Stored has a CA line for an empty one:\n%q", stored)
+	}
+}
+
+// caTaken returns content addresses in every form Nix 2.35.4 reads and
+// gets through checking a path with: text with SHA-256, and fixed with
+// each method and the algorithms it has, the digest in each of the three
+// encodings Nix tells apart by their lengths.
+func caTaken() []string {
+	var out []string
+	digests := func(size int) []string {
+		raw := make([]byte, size)
+		for i := range raw {
+			raw[i] = byte(i*7 + 1)
+		}
+		raw[size-1] &= 0x0f // a digest that Nix's base 32 holds exactly
+		return []string{
+			hex.EncodeToString(raw),
+			strings.ToUpper(hex.EncodeToString(raw)),
+			nix32.Encode(raw),
+			base64.StdEncoding.EncodeToString(raw),
+		}
+	}
+	for _, digest := range digests(32) {
+		out = append(out, "text:sha256:"+digest)
+	}
+	for _, algo := range []struct {
+		name string
+		size int
+	}{{"md5", 16}, {"sha1", 20}, {"sha256", 32}, {"sha512", 64}, {"blake3", 32}} {
+		for _, method := range []string{"", "r:", "git:"} {
+			if method == "git:" && algo.name != "sha1" && algo.name != "sha256" {
+				continue
+			}
+			for _, digest := range digests(algo.size) {
+				out = append(out, "fixed:"+method+algo.name+":"+digest)
+			}
+		}
+	}
+	return out
+}
+
+const (
+	zeros52 = "0000000000000000000000000000000000000000000000000000"
+	zeros64 = zeros52 + "000000000000"
+	// The base 64 of 32 zero bytes, and the same with bits set that belong
+	// to no byte.
+	zeros44     = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	zeros44Bits = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB="
+)
+
+// caNixRefuses are content addresses that make Nix 2.35.4 refuse the whole
+// narinfo.
+var caNixRefuses = []string{
+	"garbage",
+	"text:",
+	"fixed:",
+	"fixed:r:",
+	"fixed:sha256",
+	"fixed:sha256:",
+	"fixed:r:sha256:",
+	"fixed:sha256:000",
+	"fixed:sha256:" + zeros52[1:],
+	"fixed:sha256:" + zeros52 + "0",
+	"fixed:sha256:" + zeros52[1:] + "e", // not in Nix's alphabet
+	"fixed:sha256:z" + zeros52[1:],      // bits beyond the 256th
+	"fixed:sha256:" + strings.ToUpper("1b8m03r63zqhnjf7l5wnldhh7c134ap5vpj0850ymkq1iyzicy5s"),
+	"fixed:sha256:" + zeros64[1:] + "g",               // not hex
+	"fixed:r:sha256:" + zeros44[:43] + "A",            // 33 bytes
+	"fixed:r:sha256:" + zeros44[:42] + "==",           // 31 bytes
+	"fixed:r:sha256:" + strings.Repeat("-", 43) + "=", // the alphabet of URLs
+	"fixed:sha1:" + zeros52,                           // the length of another algorithm
+	"fixed:md5:" + zeros52[:32] + "0",
+	"fixed:sha3:" + zeros52,
+	"fixed:r:r:sha256:" + zeros52,
+	"fixed:text:sha256:" + zeros52,
+	"text:r:sha256:" + zeros52,
+	"text:git:sha256:" + zeros52,
+	"FIXED:sha256:" + zeros52,
+	"Text:sha256:" + zeros52,
+	"fixed:SHA256:" + zeros52,
+	"fixed:R:sha256:" + zeros52,
+	"fixed:r:sha256-" + zeros44, // SRI
+	"fixed:r:sha256:sha256:" + zeros52,
+	"fixed:r:sha256:" + zeros52 + ":x",
+	"sha256:" + zeros52,
+	"source:sha256:" + zeros52,
+}
+
+// caNixFailsOver are content addresses Nix 2.35.4 parses and then fails
+// over when it checks the path's signatures: with a failed assertion for a
+// text address of another algorithm than SHA-256, with an error for a git
+// address of another than SHA-1 or SHA-256.
+var caNixFailsOver = []string{
+	"text:sha1:" + zeros52[:32],
+	"text:md5:" + zeros52[:26],
+	"text:sha512:" + zeros52 + zeros52[:51],
+	"text:blake3:" + zeros52,
+	"fixed:git:md5:" + zeros52[:26],
+	"fixed:git:sha512:" + zeros52 + zeros52[:51],
+	"fixed:git:blake3:" + zeros52,
+}
+
+// caReferences are content addresses with the references of their paths,
+// to the path itself and to another, and whether Nix 2.35.4 gets through
+// checking the path's signatures: a text refers to other paths only (a
+// failed assertion otherwise), a NAR hashed with SHA-256 to any, and what
+// else is fixed to none.
+var caReferences = []struct {
+	ca          string
+	self, other bool
+	ok          bool
+}{
+	{"text:sha256:" + zeros52, false, true, true},
+	{"text:sha256:" + zeros52, true, false, false},
+	{"text:sha256:" + zeros52, true, true, false},
+	{"fixed:r:sha256:" + zeros52, true, true, true},
+	{"fixed:sha256:" + zeros52, false, true, false},
+	{"fixed:sha256:" + zeros52, true, false, false},
+	{"fixed:r:sha1:" + zeros52[:32], false, true, false},
+	{"fixed:r:sha512:" + zeros52 + zeros52[:51], true, true, false},
+	{"fixed:git:sha1:" + zeros52[:32], false, true, false},
+	{"fixed:git:sha256:" + zeros52, true, false, false},
+	{"", true, true, true},
+}
+
+func TestParseCA(t *testing.T) {
+	for _, ca := range caTaken() {
+		info, err := Parse([]byte(minimal("CA: " + ca)))
+		if err != nil {
+			t.Errorf("CA %q: %v", ca, err)
+			continue
+		}
+		if info.CA != ca {
+			t.Errorf("CA %q parsed as %q", ca, info.CA)
+		}
+		if !strings.HasSuffix(string(info.Stored()), "\nCA: "+ca+"\n") {
+			t.Errorf("CA %q is not stored as it came:\n%s", ca, info.Stored())
+		}
+	}
+	// Stricter than Nix, which reads it as zeros: no two texts for one
+	// digest, as for a signature.
+	stricter := []string{"fixed:r:sha256:" + zeros44Bits}
+	for _, ca := range slices.Concat(caNixRefuses, caNixFailsOver, stricter) {
+		info, err := Parse([]byte(minimal("CA: " + ca)))
+		if !errors.Is(err, ErrMalformed) {
+			t.Errorf("CA %q: error %v, want ErrMalformed", ca, err)
+		}
+		if info != nil {
+			t.Errorf("CA %q: Parse returned an Info with its error", ca)
+		}
+	}
+
+	// The references, whichever of the two lines comes first.
+	for _, c := range caReferences {
+		var names []string
+		if c.other {
+			names = append(names, pathB)
+		}
+		if c.self {
+			names = append(names, pathA)
+		}
+		references, ca := "References: "+strings.Join(names, " "), "CA: "+c.ca
+		for _, text := range []string{minimal(references, ca), minimal(ca, references)} {
+			_, err := Parse([]byte(text))
+			if c.ok && err != nil {
+				t.Errorf("CA %q with the references %q: %v", c.ca, names, err)
+			}
+			if !c.ok && !errors.Is(err, ErrMalformed) {
+				t.Errorf("CA %q with the references %q: error %v, want ErrMalformed", c.ca, names, err)
+			}
+		}
+	}
+}
+
+// TestCAAgainstNix asks the nix on PATH, read-only, about the content
+// addresses of TestParseCA: a binary cache of narinfos in a directory of
+// the test's own, and Nix's cache of what it read there in another.
+func TestCAAgainstNix(t *testing.T) {
+	if _, err := exec.LookPath("nix"); err != nil {
+		t.Skip("nix is not on PATH")
+	}
+	cache, home := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(cache, "nix-cache-info"), []byte("StoreDir: "+StoreDir+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// narinfo writes the narinfo of a store path of its own with the
+	// content address ca and references to itself and to another path,
+	// and returns the path.
+	narinfo := func(ca string, self, other bool) string {
+		t.Helper()
+		sum := sha256.Sum256(fmt.Append(nil, ca, self, other))
+		base := nix32.Encode(sum[:20]) + "-probe"
+		var references []string
+		if other {
+			references = append(references, pathB)
+		}
+		if self {
+			references = append(references, base)
+		}
+		text := "StorePath: " + StoreDir + "/" + base + "\nURL: nar/" + narHashNix32 + ".nar\nCompression: none\n" +
+			"NarHash: sha256:" + narHashNix32 + "\nNarSize: 120\nReferences: " + strings.Join(references, " ") + "\nCA: " + ca + "\n"
+		if err := os.WriteFile(filepath.Join(cache, base[:hashPartLen]+".narinfo"), []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return StoreDir + "/" + base
+	}
+	// The two forms that are experimental in Nix 2.35 are switched on for
+	// the command alone.
+	nix := func(args ...string) (string, error) {
+		cmd := exec.Command("nix", append([]string{"--extra-experimental-features", "nix-command git-hashing blake3-hashes"}, args...)...)
+		cmd.Env = append(os.Environ(), "XDG_CACHE_HOME="+home, "NIX_CONFIG=")
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	store := "file://" + cache
+	switch out, err := nix("store", "info", "--store", store); {
+	case err != nil:
+		t.Skipf("this nix does not read a cache of files: %v\n%s", err, out)
+	case strings.Contains(out, "unknown experimental feature"):
+		t.Skipf("this nix is older than the forms it is asked about:\n%s", out)
+	}
+
+	// What Parse takes, Nix reads, and gets through checking the path's
+	// signatures with.
+	var taken, failing []string
+	for _, ca := range caTaken() {
+		taken = append(taken, narinfo(ca, false, false))
+	}
+	for _, ca := range caNixFailsOver {
+		failing = append(failing, narinfo(ca, false, false))
+	}
+	for _, c := range caReferences {
+		if c.ok {
+			taken = append(taken, narinfo(c.ca, c.self, c.other))
+		} else {
+			failing = append(failing, narinfo(c.ca, c.self, c.other))
+		}
+	}
+	if out, err := nix(append([]string{"path-info", "--store", store}, taken...)...); err != nil {
+		t.Errorf("nix does not read what Parse takes: %v\n%s", err, out)
+	}
+	// None of them is signed, and Nix says so of each when it got that far.
+	out, err := nix(append([]string{"store", "verify", "--no-contents", "--store", store}, taken...)...)
+	if n := strings.Count(out, "is untrusted"); n != len(taken) || strings.Contains(out, "Assertion failed") {
+		t.Errorf("nix got through the signatures of %d of the %d paths Parse takes: %v\n%s", n, len(taken), err, out)
+	}
+
+	// What Parse refuses, Nix refuses, or reads and then fails over.
+	for _, ca := range caNixRefuses {
+		if out, err := nix("path-info", "--store", store, narinfo(ca, false, false)); err == nil {
+			t.Errorf("nix reads the content address %q, which Parse refuses:\n%s", ca, out)
+		}
+	}
+	for _, path := range failing {
+		if out, err := nix("path-info", "--store", store, path); err != nil {
+			t.Errorf("nix does not read the narinfo of %s: %v\n%s", path, err, out)
+		}
+		out, err := nix("store", "verify", "--no-contents", "--store", store, path)
+		if err == nil || strings.Contains(out, "is untrusted") {
+			t.Errorf("nix gets through the signatures of %s, which Parse refuses: %v\n%s", path, err, out)
+		}
 	}
 }
 
