@@ -14,8 +14,9 @@
 // path. Per NAR hash there is an entry while its content work is queued or
 // running, after it failed for now (the staged NAR stays, and the next
 // request that needs it starts the work again), and after it failed for
-// good (the reason stays, until the NAR is sent again). A finished push
-// leaves no entry: from then on the server says what there is.
+// good (the reason stays, until the NAR is sent again or the server is
+// found to have the content after all). A finished push leaves no entry:
+// from then on the server says what there is.
 //
 // A few content pushes run at once and the rest wait, those a narinfo has
 // asked for before the others. Narinfo pushes have places of their own.
@@ -32,6 +33,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/amber-store/core/fstree"
 	"github.com/amber-store/core/key"
 
 	"github.com/amber-store/narrenhaus/nix32"
@@ -141,6 +143,11 @@ type Uploader struct {
 	idleSince time.Time
 	// jobs counts the goroutines of content and narinfo work.
 	jobs sync.WaitGroup
+
+	// tamper, which only tests set, is shown each object on its way into
+	// a staged NAR and returns what is written in its place, or false to
+	// leave it out: the defects and the limits staging has to answer for.
+	tamper func(o fstree.Object) (fstree.Object, bool)
 }
 
 // New returns an uploader whose work runs under ctx.
@@ -183,6 +190,14 @@ func New(ctx context.Context, cache *packcache.Cache, rem *remote.Remote, store 
 // stopped. No work begins after it, and requests are answered 502. What
 // is staged stays where it is; the cache removes it when it is next
 // opened. Close belongs before the store's and the cache's.
+//
+// Close does not wait for the requests that are being handled. A PutNAR
+// that is staging stops at the next object it would write, drops what it
+// staged and answers 502, but one that waits for more of its body is not
+// woken: it stops when the body gives it bytes or an error. So the caller
+// first ends the requests, which for the command is shutting down the
+// HTTP server and cutting the connections that remain, then calls Close,
+// and closes the cache only when no handler runs any more.
 func (u *Uploader) Close() {
 	u.mu.Lock()
 	u.closed = true

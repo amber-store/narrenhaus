@@ -7,12 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"time"
 
+	"github.com/amber-store/core/amberpack"
 	"github.com/amber-store/core/fstree"
 	"github.com/amber-store/core/key"
 	"github.com/amber-store/jaccard-store/client"
+	"github.com/amber-store/jaccard-store/packfile"
 
 	"github.com/amber-store/narrenhaus/decompress"
 	"github.com/amber-store/narrenhaus/nar"
@@ -36,7 +39,8 @@ const (
 	stateFailedForNow
 	// stateFailedForGood: the server refused the push for a reason a
 	// repeat does not cure. The staged NAR is gone and the reason stays,
-	// until the NAR is sent again.
+	// until the NAR is sent again or the server is found to have the
+	// content after all, pushed by someone else.
 	stateFailedForGood
 )
 
@@ -141,20 +145,36 @@ func (u *Uploader) stage(urlHash string, body io.Reader) (*stagedNAR, error) {
 	}
 	defer w.Discard() // does nothing once the file is sealed
 
-	// A write that fails is told apart from a NAR that is malformed by
-	// being noted here: Ingest returns either as it got it.
-	var writeErr error
+	// What ends the staging from this side is told apart from a NAR that
+	// is malformed by being noted here: Ingest returns either as it got
+	// it. objects counts what the file took, an object that came again
+	// included.
+	var stop *Error
+	objects := 0
 	emit := func(o fstree.Object) error {
-		if err := w.Add(o.Key, o.Bytes); err != nil {
-			writeErr = err
-			return err
+		if u.ctx.Err() != nil {
+			// Nothing more is read or written for an uploader that is
+			// closed.
+			stop = u.stopped()
+			return stop
 		}
+		if u.tamper != nil {
+			var keep bool
+			if o, keep = u.tamper(o); !keep {
+				return nil
+			}
+		}
+		if err := w.Add(o.Key, o.Bytes); err != nil {
+			stop = u.notStaged(err, o, objects)
+			return stop
+		}
+		objects++
 		return nil
 	}
 	node, sum, size, err := nartree.Ingest(in, emit)
 	switch {
-	case writeErr != nil:
-		return nil, u.unwritable(writeErr)
+	case stop != nil:
+		return nil, stop
 	case errors.Is(err, nar.ErrMalformed):
 		return nil, failf(http.StatusBadRequest, err, "the body is no NAR as Nix writes one: %v", err)
 	case err != nil:
@@ -168,7 +188,10 @@ func (u *Uploader) stage(urlHash string, body io.Reader) (*stagedNAR, error) {
 			"the NAR has the SHA-256 %s and was sent uncompressed to the URL of %s", hash, urlHash)
 	}
 	root, err := nartree.Root(node, sum, size, emit)
-	if err != nil {
+	switch {
+	case stop != nil:
+		return nil, stop
+	case err != nil:
 		return nil, u.unwritable(err)
 	}
 	file, err := w.Seal()
@@ -181,6 +204,38 @@ func (u *Uploader) stage(urlHash string, body io.Reader) (*stagedNAR, error) {
 	}
 	u.log.Debug("a NAR is staged", "NAR", hash, "bytes", size, "root", root.String(), "compressed", compressed)
 	return &stagedNAR{hash: hash, size: size, root: root, file: file}, nil
+}
+
+// notStaged is the answer when the staged file did not take the object o
+// and said err, after it had taken objects others: 507 for a write that
+// failed, and 422 when it is the file that takes no such object or no
+// more of them, which no repeat cures.
+func (u *Uploader) notStaged(err error, o fstree.Object, objects int) *Error {
+	limit := beyond(err, o, objects)
+	if limit == "" {
+		return u.unwritable(err)
+	}
+	u.log.Error("a NAR is beyond what a staged file holds; the upload is refused", "reason", limit, "error", err.Error())
+	return failf(http.StatusUnprocessableEntity, err, "narrenhaus cannot keep this NAR: %s", limit)
+}
+
+// beyond names the limit of a staged file that the object o ran into when
+// the file refused it with err, after objects others; "" when err is a
+// write that failed. The cache has no error of its own for its limits, so
+// they are looked for here: in the object, and in the count together with
+// err not being what the operating system says of a write. The count takes
+// an object that came again for a new one, so it is never too low.
+func beyond(err error, o fstree.Object, objects int) string {
+	var system *fs.PathError
+	switch {
+	case len(o.Bytes) > amberpack.MaxPayload:
+		return fmt.Sprintf("one of its objects has %d bytes, and a pack takes none above %d", len(o.Bytes), amberpack.MaxPayload)
+	case o.Key.Validate() != nil:
+		return fmt.Sprintf("the key %s of one of its objects is not canonical; this is a defect of narrenhaus", o.Key)
+	case objects >= packfile.MaxEntries && !errors.As(err, &system):
+		return fmt.Sprintf("it makes more than the %d objects a pack holds", packfile.MaxEntries)
+	}
+	return ""
 }
 
 // unwritable is the answer when the staging directory did not take what
@@ -408,7 +463,9 @@ func (u *Uploader) logPush(msg, name string, res client.PushResult, started time
 // could not be asked.
 //
 // It downloads nothing. A hash that is no SHA-256 in Nix's base 32 names
-// no reference: false, and the server is not asked.
+// no reference: false, and the server is not asked. When the server has
+// the reference of a NAR whose push it had refused for good, the entry
+// with the refusal is dropped: the narinfo that follows is not held to it.
 func (u *Uploader) HeadNAR(ctx context.Context, narHash string) (bool, error) {
 	leave, err := u.enter()
 	if err != nil {
@@ -419,6 +476,10 @@ func (u *Uploader) HeadNAR(ctx context.Context, narHash string) (bool, error) {
 	u.mu.Lock()
 	w := u.entries[narHash]
 	busy := w != nil && (w.state == stateQueued || w.state == stateRunning)
+	var refused *attempt
+	if w != nil && w.state == stateFailedForGood {
+		refused = w.attempt
+	}
 	u.mu.Unlock()
 	switch {
 	case busy:
@@ -429,6 +490,11 @@ func (u *Uploader) HeadNAR(ctx context.Context, narHash string) (bool, error) {
 	_, _, err = u.rem.Lookup(ctx, u.store.ContentName(narHash))
 	switch {
 	case err == nil:
+		if refused != nil {
+			// Nix sends no NAR after this answer, so the narinfo that
+			// follows must not meet the refusal of a push that is past.
+			u.forget(w, refused)
+		}
 		return true, nil
 	case errors.Is(err, client.ErrNotFound):
 		return false, nil

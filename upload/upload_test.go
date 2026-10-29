@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"maps"
 	"math/rand/v2"
@@ -15,15 +16,20 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/amber-store/core/amberpack"
 	"github.com/amber-store/core/fstree"
 	"github.com/amber-store/core/key"
 	"github.com/amber-store/jaccard-store/client"
+	"github.com/amber-store/jaccard-store/packfile"
 	"github.com/klauspost/compress/gzip"
 	"github.com/klauspost/compress/zstd"
 	"github.com/ulikunitz/xz"
@@ -1425,7 +1431,8 @@ func TestPushFailsForGood(t *testing.T) {
 	f.pointsAt(testPrefix+"nar/"+small.narHash+".nar", small.root)
 	f.nothingStaged()
 
-	// It stays refused, with its reason, without the server being asked.
+	// It stays refused, with its reason, while the server cannot be asked
+	// whether the content has come another way.
 	f.srv.Stop()
 	e = wantStatus(t, "PutNarinfo again", f.putNarinfo(large), http.StatusUnprocessableEntity)
 	if !strings.Contains(e.Msg, "above this server's limit") {
@@ -1902,5 +1909,294 @@ func TestReproduce(t *testing.T) {
 	}
 	if !f.log.has("level=ERROR", "defect") {
 		t.Error("a defect is not logged as one")
+	}
+}
+
+func TestANARThatDoesNotReproduce(t *testing.T) {
+	// Spec 5.1 step 6 as an upload meets it: a staged copy that lacks an
+	// object of the NAR, which is what a defect of narrenhaus would leave,
+	// is found by rebuilding it before the request is answered.
+	f := newFixture(t, config{})
+	p := pathOf(t, "defect", smallTree(1))
+	for _, lost := range slices.SortedFunc(maps.Keys(p.objs.m), func(a, b key.Key) int { return bytes.Compare(a[:], b[:]) }) {
+		f.up.tamper = func(o fstree.Object) (fstree.Object, bool) { return o, o.Key != lost }
+		err := f.up.PutNAR(background(t), p.narHash, bytes.NewReader(p.archive))
+		e := wantStatus(t, "PutNAR of a NAR staged without "+lost.String(), err, http.StatusUnprocessableEntity)
+		if !strings.Contains(e.Msg, "cannot reproduce this NAR") {
+			t.Errorf("the message does not say what is wrong: %s", e.Msg)
+		}
+		f.nothingStaged()
+		if _, _, ok := f.entry(p.narHash); ok {
+			t.Fatal("a refused upload left an entry")
+		}
+	}
+	if !f.log.has("level=ERROR", "defect") {
+		t.Error("a defect is not logged as one")
+	}
+	f.settled()
+	if _, ok := f.root(testPrefix + "nar/" + p.narHash + ".nar"); ok {
+		t.Error("the content of a refused upload is on the server")
+	}
+
+	// Staged whole, the same NAR is taken.
+	f.up.tamper = nil
+	f.upload(p)
+}
+
+func TestALimitOfStagingIsNoFailedWrite(t *testing.T) {
+	// What a staged file takes no object for is not the disk's doing: a
+	// repeat cures nothing, so the answer is not the 5xx that Nix repeats.
+	f := newFixture(t, config{})
+	p := pathOf(t, "beyond", smallTree(1))
+	f.up.tamper = func(o fstree.Object) (fstree.Object, bool) {
+		if o.Key == p.root {
+			o.Key[key.Size-1] |= 0x08 // a bit no key has set
+		}
+		return o, true
+	}
+	err := f.up.PutNAR(background(t), p.narHash, bytes.NewReader(p.archive))
+	e := wantStatus(t, "PutNAR of a NAR with an object the staged file refuses", err, http.StatusUnprocessableEntity)
+	if !strings.Contains(e.Msg, "not canonical") {
+		t.Errorf("the message does not name what was refused: %s", e.Msg)
+	}
+	f.nothingStaged()
+	if _, _, ok := f.entry(p.narHash); ok {
+		t.Error("a refused upload left an entry")
+	}
+	f.up.tamper = nil
+
+	// The three limits, and what is none of them.
+	small := fstree.Object{Key: p.root, Bytes: []byte("an object")}
+	refusal := errors.New("packcache: the file takes no more")
+	diskFull := fmt.Errorf("packcache: %w", &fs.PathError{Op: "write", Path: "staging/1.data", Err: syscall.ENOSPC})
+	huge := fstree.Object{Key: p.root, Bytes: make([]byte, amberpack.MaxPayload+1)}
+	bad := small
+	bad.Key[key.Size-1] |= 0x08
+	for _, c := range []struct {
+		name    string
+		err     error
+		o       fstree.Object
+		objects int
+		want    string // part of the limit's name, "" for a failed write
+	}{
+		{"an object above the payload limit", refusal, huge, 3, fmt.Sprint(amberpack.MaxPayload)},
+		{"a key that is not canonical", refusal, bad, 3, "not canonical"},
+		{"one object more than a pack holds", refusal, small, packfile.MaxEntries, fmt.Sprint(packfile.MaxEntries)},
+		{"a full disk", diskFull, small, 3, ""},
+		{"a full disk after as many objects as a pack holds", diskFull, small, packfile.MaxEntries + 5, ""},
+		{"another refusal before the pack is full", refusal, small, packfile.MaxEntries - 1, ""},
+	} {
+		got := beyond(c.err, c.o, c.objects)
+		if (got == "") != (c.want == "") || !strings.Contains(got, c.want) {
+			t.Errorf("%s: the limit is %q, want one that names %q", c.name, got, c.want)
+		}
+		e := f.up.notStaged(c.err, c.o, c.objects)
+		want := http.StatusUnprocessableEntity
+		if c.want == "" {
+			want = http.StatusInsufficientStorage
+		}
+		wantStatus(t, c.name, e, want)
+		if !errors.Is(e, c.err) {
+			t.Errorf("%s: the answer does not wrap the file's error", c.name)
+		}
+	}
+}
+
+func TestCloseStopsStaging(t *testing.T) {
+	// A NAR that is still arriving when the uploader is closed is not
+	// read to its end and staged for nothing.
+	f := newFixture(t, config{})
+	p := pathOf(t, "half sent", dir(map[string]node{"a": file(noise(1, 16<<20)), "b": file(noise(2, 16<<20))}))
+	half := len(p.archive) / 2
+
+	in, out := io.Pipe()
+	defer in.Close()
+	var read atomic.Int64
+	body := readerFunc(func(b []byte) (int, error) {
+		n, err := in.Read(b)
+		read.Add(int64(n))
+		return n, err
+	})
+	answer := make(chan error, 1)
+	go func() { answer <- f.up.PutNAR(background(t), p.narHash, body) }()
+	// The pipe takes the first half when all of it has been read.
+	if _, err := out.Write(p.archive[:half]); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.staged()) == 0 {
+		t.Fatal("nothing is staged of a NAR that is half read")
+	}
+
+	f.up.Close()
+	go func() {
+		out.Write(p.archive[half:])
+		out.Close()
+	}()
+	e := wantStatus(t, "PutNAR of a NAR that was arriving at Close", await(t, "PutNAR returns", answer), http.StatusBadGateway)
+	if !strings.Contains(e.Msg, "shutting down") {
+		t.Errorf("the message does not say why: %s", e.Msg)
+	}
+	// Up to the end of the chunk that was being read, and no further.
+	if after := read.Load() - int64(half); after > 4<<20 {
+		t.Errorf("%d bytes of the body were read after Close, of %d that came", after, len(p.archive)-half)
+	}
+	f.nothingStaged()
+}
+
+// readerFunc is a function as an io.Reader.
+type readerFunc func([]byte) (int, error)
+
+func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
+
+// damaging makes the bucket take the first upload of the content pack of
+// each of paths with one byte changed: a server that verifies refuses that
+// push for good.
+func (f *fixture) damaging(paths ...*storePath) {
+	var mu sync.Mutex
+	seen := map[string]bool{}
+	f.bucket.answer(func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method != http.MethodPut || !strings.HasSuffix(r.URL.Path, ".data") {
+			return false
+		}
+		root := path.Base(path.Dir(r.URL.Path))
+		mu.Lock()
+		first := !seen[root]
+		seen[root] = true
+		mu.Unlock()
+		if first && slices.ContainsFunc(paths, func(p *storePath) bool { return p.root.String() == root }) {
+			body, _ := io.ReadAll(r.Body)
+			body[len(body)/2] ^= 0xff
+			r.Body = io.NopCloser(bytes.NewReader(body))
+		}
+		return false
+	})
+}
+
+func TestRefusedForGoodThenOnTheServer(t *testing.T) {
+	// A refusal for good is of one push, not of the NAR: its pack may have
+	// been damaged on the way. When the content reaches the server another
+	// way afterwards, HEAD says so, Nix sends no NAR again, and the
+	// narinfo has to be taken: the refusal is not kept against the server.
+	f := newFixture(t, config{})
+	asked, alone, again := pathOf(t, "asked-first", smallTree(1)), pathOf(t, "narinfo-alone", smallTree(2)), pathOf(t, "sent-again", smallTree(3))
+	paths := []*storePath{asked, alone, again}
+	contentName := func(p *storePath) string { return testPrefix + "nar/" + p.narHash + ".nar" }
+	head := func(p *storePath) bool {
+		t.Helper()
+		ok, err := f.up.HeadNAR(background(t), p.narHash)
+		if err != nil {
+			t.Fatalf("HeadNAR: %v", err)
+		}
+		return ok
+	}
+	f.damaging(paths...)
+	for _, p := range paths {
+		f.putNAR(p)
+		f.inState(p, stateFailedForGood)
+	}
+	f.settled()
+
+	// While the server has none of it, the refusal stands.
+	for _, p := range paths {
+		e := wantStatus(t, "PutNarinfo for content the server refused", f.putNarinfo(p), http.StatusUnprocessableEntity)
+		if !strings.Contains(e.Msg, "malformed_pack") {
+			t.Errorf("the message does not carry the server's reason: %s", e.Msg)
+		}
+		if head(p) {
+			t.Errorf("HeadNAR is true for %s, which the server has not", p.name)
+		}
+		if st, _, ok := f.entry(p.narHash); !ok || st != stateFailedForGood {
+			t.Fatalf("the work for %s is %v (%v), want failed for good", p.name, st, ok)
+		}
+	}
+
+	// A colleague uploads two of the NARs.
+	for _, p := range []*storePath{asked, alone} {
+		f.push(contentName(p), p.root, p.objs, 0.5)
+	}
+
+	// With ?compression=none Nix asks first, is told that the NAR is
+	// there, and sends the narinfo alone.
+	if !head(asked) {
+		t.Fatal("HeadNAR is false for content the server has")
+	}
+	if _, _, ok := f.entry(asked.narHash); ok {
+		t.Error("the refusal outlived HeadNAR finding the content on the server")
+	}
+	if err := f.putNarinfo(asked); err != nil {
+		t.Fatalf("PutNarinfo after HeadNAR found the content: %v", err)
+	}
+	// The narinfo without the question before it.
+	if err := f.putNarinfo(alone); err != nil {
+		t.Fatalf("PutNarinfo for content that reached the server another way: %v", err)
+	}
+	if _, _, ok := f.entry(alone.narHash); ok {
+		t.Error("the refusal outlived PutNarinfo finding the content on the server")
+	}
+	for _, p := range []*storePath{asked, alone} {
+		infoRoot, _ := narinfoRoot(t, p.stored(t))
+		f.pointsAt(testPrefix+p.hash+".narinfo", infoRoot)
+	}
+
+	// The refusal that is dropped is the one that was looked at. An entry
+	// whose NAR was sent again meanwhile has work of its own, which is not
+	// forgotten with it.
+	f.up.mu.Lock()
+	w := f.up.entries[again.narHash]
+	refused := w.attempt
+	f.up.mu.Unlock()
+	arrived, release := f.hold(putOf(again.root))
+	f.putNAR(again)
+	await(t, "the second push reaches the bucket", arrived)
+	f.up.forget(w, refused)
+	if st, _, ok := f.entry(again.narHash); !ok || st != stateRunning {
+		t.Fatalf("the work that runs again is %v (%v), want running", st, ok)
+	}
+	release()
+	if err := f.putNarinfo(again); err != nil {
+		t.Fatalf("PutNarinfo after the NAR was sent again: %v", err)
+	}
+	f.settled()
+	f.pointsAt(contentName(again), again.root)
+	f.nothingStaged()
+}
+
+func TestABodyThatAsksForTooMuchMemory(t *testing.T) {
+	// 84 bytes as `xz --lzma2=dict=1536MiB` wrote them: the body states
+	// the dictionary its reader is to hold. It is refused as a body that
+	// cannot be read, before the memory is asked for.
+	body, err := base64.StdEncoding.DecodeString(
+		"/Td6WFoAAATm1rRGBMAXEyEBJQAAAAAAAAAAAG9QKl0BABJhIE5BUiB3b3VsZCBiZSBoZXJlAACPKcuinFM2xgABMxPFkVNQH7bzfQEAAAAABFla")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFixture(t, config{})
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	err = f.up.PutNAR(background(t), fileHash(body), bytes.NewReader(body))
+	runtime.ReadMemStats(&after)
+	wantStatus(t, "PutNAR of an xz body with a dictionary of 1536 MiB", err, http.StatusBadRequest)
+	if grown := after.TotalAlloc - before.TotalAlloc; grown > 256<<20 {
+		t.Errorf("a body of %d bytes made narrenhaus allocate %d MiB", len(body), grown>>20)
+	}
+	f.nothingStaged()
+}
+
+func TestDefaults(t *testing.T) {
+	// The limits the design fixes (spec 5 and 5.1). The command passes
+	// none of its own, so these are the ones it runs with.
+	u := New(context.Background(), nil, nil, nil, Options{})
+	defer u.Close()
+	if u.contentPushes != 4 {
+		t.Errorf("%d content pushes at once, want 4", u.contentPushes)
+	}
+	if n := cap(u.narinfoPlaces); n != 8 {
+		t.Errorf("%d narinfo pushes at once, want 8", n)
+	}
+	if u.minDedup != 0.5 {
+		t.Errorf("MinDedup is %v, want 0.5", u.minDedup)
+	}
+	if u.idleExpiry != 15*time.Minute {
+		t.Errorf("staged NARs are deleted after %v idle, want 15 minutes", u.idleExpiry)
 	}
 }

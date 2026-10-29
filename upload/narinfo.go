@@ -159,14 +159,16 @@ func (u *Uploader) pushNarinfo(storeHash string, info *narinfo.Info, stored []by
 // info names is on the server (spec 5.3 step 2). Work for it that is
 // queued or running is marked as asked for by a narinfo and waited for;
 // work that failed for now is started again first. Without an entry the
-// server is asked.
+// server is asked, and so it is for work that failed for good: the
+// refusal was of that push, and the content may have reached the server
+// another way since.
 func (u *Uploader) awaitContent(info *narinfo.Info) error {
 	hash := info.NarHashNix32()
+	name := u.store.ContentName(hash)
 	u.mu.Lock()
 	w := u.entries[hash]
 	if w == nil {
 		u.mu.Unlock()
-		name := u.store.ContentName(hash)
 		_, _, err := u.rem.Lookup(u.ctx, name)
 		switch {
 		case err == nil:
@@ -186,9 +188,17 @@ func (u *Uploader) awaitContent(info *narinfo.Info) error {
 	// Asked for, from now on: also when the work is started again later.
 	u.queue.promote(w)
 	if w.state == stateFailedForGood {
-		reason := w.attempt.err
+		refused := w.attempt
+		reason := refused.err
 		u.mu.Unlock()
-		return refusedContent(reason)
+		// HEAD asks the server too and may have said that the NAR is
+		// there: Nix then sends none, and nothing else replaces the entry.
+		// A server that cannot be asked leaves the refusal standing.
+		if _, _, err := u.rem.Lookup(u.ctx, name); err != nil {
+			return refusedContent(reason)
+		}
+		u.forget(w, refused)
+		return nil
 	}
 	if w.state == stateFailedForNow {
 		u.startLocked(w)
@@ -210,6 +220,24 @@ func (u *Uploader) awaitContent(info *narinfo.Info) error {
 		return u.stopped()
 	}
 	return unreachable(a.err, "the NAR of this store path could not be pushed for now and stays staged")
+}
+
+// forget removes the entry w, whose attempt a the server refused for
+// good, now that the server was found to have the content reference
+// after all: from here on the server says what there is. The lock was not
+// held while the server was asked, so the entry is looked at again: one
+// whose NAR was sent again meanwhile has work of its own, queued or
+// running, and stays.
+func (u *Uploader) forget(w *work, a *attempt) {
+	u.mu.Lock()
+	gone := u.entries[w.hash] == w && w.state == stateFailedForGood && w.attempt == a
+	if gone {
+		delete(u.entries, w.hash)
+	}
+	u.mu.Unlock()
+	if gone {
+		u.log.Info("the server has content after all whose push it had refused for good; the refusal is forgotten", "name", w.name)
+	}
 }
 
 // refusedContent is the answer to a narinfo whose content the server
