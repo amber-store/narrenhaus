@@ -1753,9 +1753,10 @@ func TestServeRemovesStagedNARsNobodyCameBackFor(t *testing.T) {
 	eventually(t, "the staged NAR is removed", func() bool {
 		return len(files(t, opts.CacheDir, "staging")) == 0
 	})
-	if d.logged("staged NARs whose pushes had failed were deleted: no upload came back for them") != 1 {
-		t.Errorf("the log does not say that the staged NAR was deleted:\n%s", d.log.String())
-	}
+	// The line is written after the files are gone.
+	eventually(t, "the log says that the staged NAR was deleted", func() bool {
+		return d.logged("staged NARs whose pushes had failed were deleted: no upload came back for them") == 1
+	})
 }
 
 // The size of --cache-size is the cache's: with one below any pack,
