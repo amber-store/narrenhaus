@@ -68,11 +68,16 @@ type host struct {
 	// grace is how long requests that run when serve is told to stop get
 	// to finish.
 	grace time.Duration
+	// cutWait is how long serve waits for the requests it cut.
+	cutWait time.Duration
 	// sweepEvery is how often staged uploads nobody came back for are
 	// looked for, and idleExpiry how long one may lie there before it is
 	// removed; zero is the uploader's own time, 15 minutes.
 	sweepEvery time.Duration
 	idleExpiry time.Duration
+	// serveWait is how long a request waits for a reference that is being
+	// fetched; zero is the handler's own time, 240 seconds.
+	serveWait time.Duration
 }
 
 // thisHost is the machine as it is: the server is found by its endpoint
@@ -82,6 +87,7 @@ func thisHost() host {
 		connect:    dialServer(),
 		listen:     func(address string) (net.Listener, error) { return net.Listen("tcp", address) },
 		grace:      shutdownGrace,
+		cutWait:    cutWait,
 		sweepEvery: sweepEvery,
 	}
 }
@@ -129,9 +135,16 @@ func serve(ctx context.Context, opts options, stderr io.Writer, h host) error {
 	if err != nil {
 		return fmt.Errorf("--cache-dir: %w", err)
 	}
-	// The directory is given up whichever way serve returns; closing the
-	// cache a second time does nothing.
-	defer cache.Close()
+	// stuck is set when serve leaves although a request still runs. What
+	// the request stands on is not closed then.
+	stuck := false
+	// Otherwise the directory is given up whichever way serve returns;
+	// closing the cache a second time does nothing.
+	defer func() {
+		if !stuck {
+			cache.Close()
+		}
+	}()
 
 	ln, err := h.listen(opts.Listen)
 	if err != nil {
@@ -170,10 +183,13 @@ func serve(ctx context.Context, opts options, stderr io.Writer, h host) error {
 		}
 	})
 	// The way down, once serve has stopped answering: the work, then what
-	// the work stood on.
+	// the work stood on, unless a request still stands on it.
 	down := sync.OnceFunc(func() {
 		stopWork()
 		sweeper.Wait()
+		if stuck {
+			return
+		}
 		up.Close()
 		store.Close()
 		cache.Close()
@@ -191,12 +207,13 @@ func serve(ctx context.Context, opts options, stderr io.Writer, h host) error {
 	name, _, _ := net.SplitHostPort(opts.Listen)
 	srv := &http.Server{
 		Handler: requests.wrap(httpd.New(httpd.Config{
-			Store:    store,
-			Uploader: up,
-			Key:      signing,
-			Priority: opts.Priority,
-			Host:     name,
-			Log:      log,
+			Store:     store,
+			Uploader:  up,
+			Key:       signing,
+			Priority:  opts.Priority,
+			ServeWait: h.serveWait,
+			Host:      name,
+			Log:       log,
 		})),
 		BaseContext:       func(net.Listener) context.Context { return answering },
 		ReadHeaderTimeout: readHeaderTimeout,
@@ -227,15 +244,17 @@ func serve(ctx context.Context, opts options, stderr io.Writer, h host) error {
 	if srv.Shutdown(grace) != nil {
 		cut()
 		srv.Close()
-		if requests.wait(cutWait) {
+		if requests.wait(h.cutWait) {
 			log.Warn("requests that were still running have been cut")
 		} else {
 			// A request that outlives both its context and its connection
-			// is not waited for any longer. It finds the cache closed
-			// under it, which costs errors in the log of a process that
-			// is ending and nothing that is kept: what such a request
-			// leaves staged goes when the directory is next opened.
-			log.Warn("requests that were cut are still running")
+			// is not waited for any longer, and nothing is closed under
+			// it: the process is ending, and its end gives up the
+			// directory and the connections. The work is stopped, which an
+			// upload that is being staged notices at its next object; what
+			// it leaves staged goes when the directory is next opened.
+			stuck = true
+			log.Warn("requests that were cut are still running; nothing is closed under them")
 		}
 	}
 	down()

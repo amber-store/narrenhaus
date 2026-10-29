@@ -1410,6 +1410,151 @@ func TestServeWaitsForTheRequestsItCut(t *testing.T) {
 	}
 }
 
+// held is a listener whose connections stay open after they were closed,
+// until release is closed: a request on one of them does not notice that
+// it was cut.
+type held struct {
+	net.Listener
+	release <-chan struct{}
+}
+
+func (l held) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return heldConn{conn, l.release}, nil
+}
+
+type heldConn struct {
+	net.Conn
+	release <-chan struct{}
+}
+
+func (c heldConn) Close() error {
+	go func() {
+		<-c.release
+		c.Conn.Close()
+	}()
+	return nil
+}
+
+// A request that still runs after it was cut and waited for has nothing
+// closed under it: serve says so and returns, the process being at its
+// end, and the request ends on a cache that is open.
+func TestServeClosesNothingUnderARequestThatStillRuns(t *testing.T) {
+	clearEnvironment(t)
+	noNix(t)
+	srv := testserver.Start(t, testserver.Options{})
+	opts := testOptions(t, t.TempDir())
+	release := make(chan struct{})
+	h := hostOf(srv, 100*time.Millisecond)
+	h.cutWait = 300 * time.Millisecond
+	h.listen = func(address string) (net.Listener, error) {
+		ln, err := net.Listen("tcp", address)
+		return held{ln, release}, err
+	}
+	d := startServe(t, opts, h)
+	p := newTestPath(t, strings.Repeat("a request that does not end\n", 4000))
+
+	body, feed := io.Pipe()
+	defer feed.Close()
+	go d.do(http.MethodPut, "/nar/"+p.narHash+".nar", body)
+	if _, err := feed.Write(p.archive[:len(p.archive)/2]); err != nil {
+		t.Fatal(err)
+	}
+	uploading(t, opts.CacheDir)
+
+	began := time.Now()
+	if err := d.stop(); err != nil {
+		t.Errorf("serve returned %v", err)
+	}
+	if took := time.Since(began); took < 400*time.Millisecond || took > 10*time.Second {
+		t.Errorf("serve took %v to stop, want the 100ms it gives requests and the 300ms it waits for those it cut", took)
+	}
+	if d.logged("requests that were cut are still running; nothing is closed under them") != 1 || d.logged("requests that were still running have been cut") != 0 {
+		t.Errorf("serve does not say that a request it cut still runs:\n%s", d.log.String())
+	}
+	// The request is where it was, and the cache is still its own.
+	if names := files(t, opts.CacheDir, "staging"); len(names) == 0 {
+		t.Error("nothing is staged: the request has ended, and the test shows nothing")
+	}
+	cache, err := packcache.Open(opts.CacheDir, opts.CacheSize, packcache.Origin{Server: testServer, Prefix: opts.Prefix})
+	if err == nil {
+		cache.Close()
+	}
+	if !errors.Is(err, packcache.ErrInUse) {
+		t.Errorf("opening the cache directory under the request that still runs: %v, want ErrInUse: serve closed the cache", err)
+	}
+
+	// When the request ends at last, it takes back what it staged, which
+	// a cache that was closed under it does not do.
+	close(release)
+	eventually(t, "the request has ended and taken back what it staged", func() bool {
+		return len(files(t, opts.CacheDir, "staging")) == 0
+	})
+}
+
+// A request waits for a reference that is being fetched as long as the
+// host says, and is answered that there is nothing when the time is over;
+// the fetch goes on for the request that comes next.
+func TestServeWaitsForAReferenceAsLongAsItsHostSays(t *testing.T) {
+	clearEnvironment(t)
+	noNix(t)
+	srv := testserver.Start(t, testserver.Options{})
+	a := startServe(t, testOptions(t, t.TempDir()), hostOf(srv, time.Second))
+	p := newTestPath(t, "a path whose packs are slow to come\n")
+	a.want(http.StatusOK, http.MethodPut, "/nar/"+p.narHash+".nar", p.archive)
+	a.want(http.StatusOK, http.MethodPut, "/"+p.hash+".narinfo", p.narinfo)
+
+	// The bucket lets no download through until the test says so.
+	gate := make(chan struct{})
+	release := sync.OnceFunc(func() { close(gate) })
+	defer release()
+	srv.Intercept(func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == http.MethodGet {
+			select {
+			case <-gate:
+			case <-r.Context().Done():
+			}
+		}
+		return false
+	})
+	const wait = 300 * time.Millisecond
+	h := hostOf(srv, time.Second)
+	h.serveWait = wait
+	b := startServe(t, testOptions(t, t.TempDir()), h)
+
+	type answer struct {
+		status int
+		err    error
+		took   time.Duration
+	}
+	answered := make(chan answer, 1)
+	go func() {
+		began := time.Now()
+		status, _, err := b.do(http.MethodGet, "/"+p.hash+".narinfo", nil)
+		answered <- answer{status, err, time.Since(began)}
+	}()
+	select {
+	case got := <-answered:
+		if got.err != nil || got.status != http.StatusNotFound {
+			t.Fatalf("GET of a narinfo whose pack does not come: status %d, %v, want 404", got.status, got.err)
+		}
+		if got.took < wait {
+			t.Errorf("the request was answered after %v, before the %v it waits", got.took, wait)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the request still waits after 10s; its host said %v", wait)
+	}
+
+	release()
+	eventually(t, "the narinfo is served once its pack has come", func() bool {
+		status, _, err := b.do(http.MethodGet, "/"+p.hash+".narinfo", nil)
+		return err == nil && status == http.StatusOK
+	})
+}
+
 // eventually waits until cond holds.
 func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
@@ -1756,7 +1901,8 @@ func TestServeDialsTheServerOfItsOptions(t *testing.T) {
 
 // thisHost keeps the times the design names: ten seconds for requests that
 // run when serve is told to stop, a look at the staged uploads every
-// minute, and the uploader's own idle time.
+// minute, the uploader's own idle time, and the handler's own wait for a
+// reference. The five seconds for requests that were cut are serve's own.
 func TestThisHostKeepsTheTimesOfTheDesign(t *testing.T) {
 	h := thisHost()
 	if h.grace != 10*time.Second {
@@ -1767,6 +1913,12 @@ func TestThisHostKeepsTheTimesOfTheDesign(t *testing.T) {
 	}
 	if h.idleExpiry != 0 {
 		t.Errorf("the idle time is %v, want it left to the uploader", h.idleExpiry)
+	}
+	if h.cutWait != 5*time.Second {
+		t.Errorf("requests that were cut are waited for %v, want 5s", h.cutWait)
+	}
+	if h.serveWait != 0 {
+		t.Errorf("a request waits %v for its reference, want that left to the handler, whose time is 240s", h.serveWait)
 	}
 }
 
