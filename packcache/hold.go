@@ -17,13 +17,15 @@ import (
 // packs it found, to its end: if one of them is dropped it stays readable
 // through the hold, and a pack placed under the same root meanwhile is not
 // read by it. A hold from Reserve follows its roots: it reads the pack
-// cached under each of them at the time of the read, so one that was
-// placed after the reservation, or in place of a pack that was dropped, is
-// read as soon as it is there. Until then a dropped pack stays readable
-// through a reservation too.
+// that was placed last under each of them, so one that was placed after
+// the reservation, or in place of a pack that was dropped, is read as soon
+// as it is there. Until then a dropped pack stays readable through a
+// reservation too, whether the reservation had read from it or not: a
+// pack is the reservation's from the moment it is placed.
 //
-// Get and Has are safe for concurrent calls. Release ends the hold; it
-// belongs after the last read, not beside it.
+// Get and Has are safe for concurrent calls, and take no lock of the
+// cache. Release ends the hold; it belongs after the last read, not
+// beside it.
 type Hold struct {
 	c        *Cache
 	slots    []*slot
@@ -37,7 +39,7 @@ type Hold struct {
 }
 
 // slot is one root of a hold, with the pack the hold reads for it once
-// there is one.
+// there is one. The pack is set under Cache.mu and read without it.
 type slot struct {
 	root key.Key
 	pack atomic.Pointer[pack]
@@ -110,36 +112,32 @@ func (c *Cache) hold(roots []key.Key, follows bool) *Hold {
 			s.pack.Store(p)
 			c.stamp(p)
 		}
+		if follows {
+			slots := c.following[root]
+			if slots == nil {
+				slots = make(map[*slot]*Hold)
+				c.following[root] = slots
+			}
+			slots[s] = h
+		}
 		h.slots[i] = s
 	}
 	return h
 }
 
-// bound returns the pack h reads for s, or nil while it has none.
-func (h *Hold) bound(s *slot) *pack {
-	p := s.pack.Load()
-	if !h.follows || (p != nil && !p.parked.Load()) {
-		return p
+// follow makes p, which was just placed, the pack that the reservations
+// of its root read. It is theirs from here on and not from their next
+// read: a pack that is dropped before a reservation has read from it is
+// kept for it like any pack that is being read. The pack a reservation
+// read until now goes to its past. The caller has c.mu.
+func (c *Cache) follow(p *pack) {
+	for s, h := range c.following[p.root] {
+		if old := s.pack.Load(); old != nil {
+			h.past = append(h.past, old)
+		}
+		p.holds++
+		s.pack.Store(p)
 	}
-	// A reservation without a pack for this root, or with one that was
-	// dropped: it reads the pack that is cached under the root now, if
-	// there is one.
-	c := h.c
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if h.released.Load() {
-		return nil
-	}
-	now := c.packs[s.root]
-	if now == nil || now == s.pack.Load() {
-		return s.pack.Load()
-	}
-	if p = s.pack.Load(); p != nil {
-		h.past = append(h.past, p)
-	}
-	now.holds++
-	s.pack.Store(now)
-	return now
 }
 
 // Get returns the object k in a slice of the caller's own, from the first
@@ -151,7 +149,7 @@ func (h *Hold) Get(k key.Key) ([]byte, error) {
 		return nil, errReleased
 	}
 	for _, s := range h.slots {
-		p := h.bound(s)
+		p := s.pack.Load()
 		if p == nil {
 			continue
 		}
@@ -172,7 +170,7 @@ func (h *Hold) Has(k key.Key) (bool, error) {
 		return false, errReleased
 	}
 	for _, s := range h.slots {
-		p := h.bound(s)
+		p := s.pack.Load()
 		if p == nil {
 			continue
 		}
@@ -200,6 +198,11 @@ func (h *Hold) Release() {
 		if c.reserved[s.root]--; c.reserved[s.root] == 0 {
 			delete(c.reserved, s.root)
 		}
+		if slots := c.following[s.root]; h.follows {
+			if delete(slots, s); len(slots) == 0 {
+				delete(c.following, s.root)
+			}
+		}
 		if p := s.pack.Load(); p != nil {
 			c.unbind(p)
 		}
@@ -219,7 +222,7 @@ func (c *Cache) unbind(p *pack) {
 	// Dropped while it was read, and this was its last reader. A closed
 	// cache deletes nothing: Open empties tmp/.
 	if c.closed {
-		p.flat.close()
+		p.flat.abandon()
 	} else {
 		p.flat.remove()
 	}

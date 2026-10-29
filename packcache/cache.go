@@ -29,6 +29,12 @@
 // position. Files are opened when first read and at most maxOpen of them
 // are open at a time, however many packs are held and uploads staged.
 //
+// What is read is not checked against its key. Nothing is synced to disk
+// either, and Open takes a pack for whole by the sizes of its files: after
+// the system went down, a pack may have the right sizes and other bytes. A
+// caller that gives out what it reads holds each object to its key itself,
+// as package refs does.
+//
 // The size of the cache is the sum of the .data and .idx files under
 // packs/. Each use of a pack stamps it: the modification time of its data
 // file is set to now. Whenever a pack is added or a hold is released, packs
@@ -62,6 +68,9 @@ var (
 	// ErrOrigin is returned, wrapped, by Open for a directory that holds
 	// the packs of another server or prefix.
 	ErrOrigin = errors.New("packcache: directory belongs to another server or prefix")
+	// ErrForeign is returned, wrapped, by Open for a directory that has no
+	// origin and holds what no cache directory holds before it has one.
+	ErrForeign = errors.New("packcache: directory is not a cache directory")
 	// ErrInUse is returned, wrapped, by Open for a directory another Cache
 	// has open, in this process or another.
 	ErrInUse = errors.New("packcache: directory is in use by another process")
@@ -80,6 +89,7 @@ const (
 	stagingName = "staging"
 	tmpName     = "tmp"
 	probeName   = ".probe"
+	newPrefix   = "new-" // of the files writeTemp makes under tmp/
 
 	dataExt = ".data"
 	idxExt  = ".idx"
@@ -98,11 +108,14 @@ type Cache struct {
 	closed   bool
 	packs    map[key.Key]*pack
 	reserved map[key.Key]int // holds per root, whether a pack is cached under it or not
-	size     uint64          // of the packs in the table
-	last     time.Time       // the newest stamp given
-	parked   uint64          // packs dropped while held, for the names of their files
-	records  map[recordID]key.Key
-	byRoot   map[key.Key]map[recordID]struct{}
+	// following are the slots of the reservations, by root: a pack placed
+	// under a root becomes what they read.
+	following map[key.Key]map[*slot]*Hold
+	size      uint64    // of the packs in the table
+	last      time.Time // the newest stamp given
+	parked    uint64    // packs dropped while held, for the names of their files
+	records   map[recordID]key.Key
+	byRoot    map[key.Key]map[recordID]struct{}
 
 	// openMu guards open, the files that are open, oldest first.
 	openMu sync.Mutex
@@ -137,10 +150,11 @@ type pack struct {
 // subdirectories that are missing, removes what an earlier process left
 // unfinished, and evicts down to limit, the size limit in bytes.
 //
-// It fails with ErrInUse for a directory that is open elsewhere and with
-// ErrOrigin for one that belongs to another server or prefix; both leave
-// the directory as it was. Any other failure names the path that could not
-// be read or written.
+// It fails with ErrInUse for a directory that is open elsewhere, with
+// ErrOrigin for one that belongs to another server or prefix, and with
+// ErrForeign for one that is no cache directory and not empty either; all
+// three leave the directory as it was. Any other failure names the path
+// that could not be read or written.
 func Open(dir string, limit uint64, origin Origin) (*Cache, error) {
 	if dir == "" {
 		return nil, errors.New("packcache: no cache directory given")
@@ -148,6 +162,10 @@ func Open(dir string, limit uint64, origin Origin) (*Cache, error) {
 	dir, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, fmt.Errorf("packcache: %w", err)
+	}
+	// Before anything is created in it, the lock included.
+	if err := checkNew(dir); err != nil {
+		return nil, err
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("packcache: %w", err)
@@ -157,19 +175,69 @@ func Open(dir string, limit uint64, origin Origin) (*Cache, error) {
 		return nil, err
 	}
 	c := &Cache{
-		dir:      dir,
-		limit:    limit,
-		lock:     lock,
-		packs:    make(map[key.Key]*pack),
-		reserved: make(map[key.Key]int),
-		records:  make(map[recordID]key.Key),
-		byRoot:   make(map[key.Key]map[recordID]struct{}),
+		dir:       dir,
+		limit:     limit,
+		lock:      lock,
+		packs:     make(map[key.Key]*pack),
+		reserved:  make(map[key.Key]int),
+		following: make(map[key.Key]map[*slot]*Hold),
+		records:   make(map[recordID]key.Key),
+		byRoot:    make(map[key.Key]map[recordID]struct{}),
 	}
 	if err := c.load(origin); err != nil {
 		lock.Close()
 		return nil, err
 	}
 	return c, nil
+}
+
+// checkNew sees to it that a directory without an origin file is one a
+// cache may be made in. Open removes everything under tmp/ and staging/,
+// and the origin file is all that tells a cache directory from a home or
+// a project that has directories of those names: without it, dir must
+// hold nothing but what an Open leaves that ended before it wrote the
+// origin. That is the lock, the four directories, and in them the probe
+// of makeDir and, under tmp/, the file the origin is written to.
+func checkNew(dir string) error {
+	if _, err := os.Lstat(filepath.Join(dir, originName)); err == nil {
+		return nil
+	}
+	foreign := func(name string) error {
+		return fmt.Errorf("%w: %s has no file %q and is not empty, it holds %q; a cache is made in an empty directory",
+			ErrForeign, dir, originName, name)
+	}
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("packcache: %w", err)
+	}
+	for _, e := range entries {
+		switch name := e.Name(); name {
+		case lockName:
+			if !e.Type().IsRegular() {
+				return foreign(name)
+			}
+		case packsName, refsName, stagingName, tmpName:
+			if !e.IsDir() {
+				return foreign(name)
+			}
+			inside, err := os.ReadDir(filepath.Join(dir, name))
+			if err != nil {
+				return fmt.Errorf("packcache: %w", err)
+			}
+			for _, in := range inside {
+				ours := in.Name() == probeName || (name == tmpName && strings.HasPrefix(in.Name(), newPrefix))
+				if !ours || !in.Type().IsRegular() {
+					return foreign(filepath.Join(name, in.Name()))
+				}
+			}
+		default:
+			return foreign(name)
+		}
+	}
+	return nil
 }
 
 // lockDir takes the lock of dir without waiting for it. The lock belongs
@@ -201,7 +269,8 @@ func lockDir(dir string) (*os.File, error) {
 // load does the work of Open once the lock is held.
 func (c *Cache) load(origin Origin) error {
 	// The origin is checked before anything is created or removed: a
-	// directory that belongs elsewhere is left exactly as it was.
+	// directory that belongs elsewhere is left exactly as it was. One
+	// without an origin was found new by checkNew.
 	known, err := c.checkOrigin(origin)
 	if err != nil {
 		return err
@@ -316,7 +385,7 @@ func (c *Cache) writeFile(path string, b []byte) error {
 
 // writeTemp writes b to a new file under tmp/ and returns its path.
 func (c *Cache) writeTemp(b []byte) (string, error) {
-	f, err := os.CreateTemp(c.TempDir(), "new-*")
+	f, err := os.CreateTemp(c.TempDir(), newPrefix+"*")
 	if err != nil {
 		return "", fmt.Errorf("packcache: %w", err)
 	}
@@ -470,7 +539,9 @@ func (c *Cache) loadPack(stem string) (*pack, error) {
 // Close gives up the lock on the directory. Holds and sealed files that
 // are still out can be read and let go of, but from here on the cache
 // changes nothing in the directory, which may be another process's now:
-// nothing is placed, recorded, dropped or evicted.
+// nothing is placed, recorded, dropped or evicted, and a file that is let
+// go of, discarded or refused by Place stays where it lies. The next Open
+// removes what is left under staging/ and tmp/.
 func (c *Cache) Close() error {
 	c.mu.Lock()
 	if c.closed {
@@ -520,7 +591,8 @@ func (c *Cache) Meta(root key.Key) (Meta, bool) {
 // If a pack is already cached under root it is kept as it is, complete or
 // patch, and s is discarded. Either way the pack is stamped, with its
 // parent if it is a patch, and eviction runs: a pack placed over the limit
-// is gone again at once unless its root is held (Reserve).
+// is gone again at once unless its root is held (Reserve). A pack that is
+// placed is read by the reservations of its root from then on.
 //
 // Place takes s whether it succeeds or not: s reads nothing afterwards and
 // its Discard does nothing.
@@ -530,6 +602,10 @@ func (c *Cache) Place(s *Sealed, root key.Key, parent *key.Key) error {
 	}
 	if !s.done.CompareAndSwap(false, true) {
 		return errors.New("packcache: place of a sealed file that was placed or discarded")
+	}
+	if c.isClosed() {
+		s.flat.abandon()
+		return errClosed
 	}
 	meta := Meta{Complete: parent == nil}
 	if parent != nil {
@@ -549,7 +625,7 @@ func (c *Cache) Place(s *Sealed, root key.Key, parent *key.Key) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
-		s.flat.remove()
+		s.flat.abandon()
 		os.Remove(tmpMeta)
 		return errClosed
 	}
@@ -568,6 +644,7 @@ func (c *Cache) Place(s *Sealed, root key.Key, parent *key.Key) error {
 		p = &pack{root: root, meta: meta, size: s.bytes + packfile.IndexSize(s.objects), flat: s.flat}
 		c.packs[root] = p
 		c.size += p.size
+		c.follow(p)
 	} else {
 		s.flat.remove()
 		os.Remove(tmpMeta)

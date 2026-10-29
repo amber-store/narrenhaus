@@ -88,7 +88,8 @@ func (w *Writer) Add(k key.Key, data []byte) error {
 }
 
 // Discard ends writing and removes the file. After Seal, and when called
-// again, it does nothing.
+// again, it does nothing. A closed cache deletes nothing: the file is left
+// for the next Open, which empties staging/ and tmp/.
 func (w *Writer) Discard() {
 	if w.done {
 		return
@@ -96,6 +97,9 @@ func (w *Writer) Discard() {
 	w.done = true
 	w.seen, w.entries = nil, nil
 	w.f.Close()
+	if w.c.isClosed() {
+		return
+	}
 	os.Remove(w.f.Name())
 	os.Remove(idxPathOf(w.f.Name()))
 }
@@ -190,11 +194,17 @@ func (s *Sealed) Has(k key.Key) bool {
 func (s *Sealed) Bytes() uint64 { return s.bytes }
 
 // Discard removes the file. After Place, and when called again, it does
-// nothing.
+// nothing. A closed cache deletes nothing: the file is read no more and
+// left for the next Open.
 func (s *Sealed) Discard() {
-	if s.done.CompareAndSwap(false, true) {
-		s.flat.remove()
+	if !s.done.CompareAndSwap(false, true) {
+		return
 	}
+	if s.c.isClosed() {
+		s.flat.abandon()
+		return
+	}
+	s.flat.remove()
 }
 
 // maxOpen is the number of flat files, each a data file and an index, that
@@ -255,10 +265,14 @@ func (fl *flat) open() error {
 		return err
 	}
 	fl.f = f
+	// The files enter the list while fl.mu is held, so that a removal or
+	// a close finds them there: entered after it, they would stay in the
+	// list as files that are open when they are gone.
+	oldest := fl.c.opened(fl)
 	fl.mu.Unlock()
 	// No lock of fl is held here: the flat to close may be waiting for
 	// this one in the same way.
-	if oldest := fl.c.opened(fl); oldest != nil {
+	if oldest != nil {
 		oldest.close()
 	}
 	return nil
@@ -294,12 +308,20 @@ func (fl *flat) move(data, idx string) error {
 }
 
 // remove deletes the two files, after the reads that are under way.
-func (fl *flat) remove() {
+func (fl *flat) remove() { fl.end(true) }
+
+// abandon is what a closed cache, which deletes nothing, does in place of
+// remove: the two files are read no more and stay where they are.
+func (fl *flat) abandon() { fl.end(false) }
+
+func (fl *flat) end(unlink bool) {
 	fl.mu.Lock()
 	f := fl.f
 	fl.f, fl.gone = nil, true
-	os.Remove(fl.idx)
-	os.Remove(fl.data)
+	if unlink {
+		os.Remove(fl.idx)
+		os.Remove(fl.data)
+	}
 	fl.mu.Unlock()
 	if f != nil {
 		f.close()
@@ -335,7 +357,8 @@ func (fl *flat) has(k key.Key) (bool, error) {
 }
 
 // opened notes that fl has opened its files and returns the flat that has
-// to close its own for it, if any.
+// to close its own for it, if any. The caller has fl.mu; openMu is taken
+// inside it and never the other way round.
 func (c *Cache) opened(fl *flat) (oldest *flat) {
 	c.openMu.Lock()
 	defer c.openMu.Unlock()

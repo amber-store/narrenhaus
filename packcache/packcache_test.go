@@ -739,7 +739,7 @@ func TestReservationFollowsItsRoot(t *testing.T) {
 	h := c.Reserve(root)
 	wantObject(t, h, stale)
 	wantAbsent(t, h, fresh)
-	inHand := h.bound(h.slots[0])
+	inHand := h.slots[0].pack.Load()
 
 	c.Drop(root)
 	wantObject(t, h, stale)
@@ -1335,4 +1335,271 @@ func TestOpenFilesAreBounded(t *testing.T) {
 	if n := openNow(); n != 0 {
 		t.Fatalf("%d files are open after all were discarded", n)
 	}
+}
+
+// A directory without an origin file is taken for a new cache only when
+// nothing is in it but what an Open that did not finish leaves. Any other
+// is somebody's, and Open empties tmp/ and staging/: it is refused, and
+// left as it was.
+func TestOpenRefusesADirectoryThatIsNoCache(t *testing.T) {
+	write := func(t *testing.T, path string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("mine"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// tree returns every path under dir, sorted.
+	tree := func(t *testing.T, dir string) []string {
+		t.Helper()
+		var out []string
+		err := filepath.WalkDir(dir, func(path string, _ os.DirEntry, err error) error {
+			if path != dir {
+				out = append(out, strings.TrimPrefix(path, dir+string(filepath.Separator)))
+			}
+			return err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	for name, files := range map[string][]string{
+		"a home with tmp and staging":   {"tmp/work/thesis.txt", "staging/work/thesis.txt"},
+		"a file in tmp":                 {"tmp/thesis.txt"},
+		"a file in staging":             {"staging/thesis.txt"},
+		"a file beside the directories": {"notes.txt"},
+		"a directory of another name":   {"src/main.go"},
+		"a file in packs":               {"packs/archive.tar"},
+		"a file in refs":                {"refs/heads/main"},
+		"a file named tmp":              {"tmp"},
+		"a directory named lock":        {"lock/file"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, f := range files {
+				write(t, filepath.Join(dir, filepath.FromSlash(f)))
+			}
+			before := tree(t, dir)
+
+			c, err := Open(dir, roomy, testOrigin)
+			if err == nil {
+				c.Close()
+			}
+			if !errors.Is(err, ErrForeign) {
+				t.Errorf("Open: %v, want ErrForeign", err)
+			} else if !strings.Contains(err.Error(), dir) || strings.Contains(err.Error(), "\n") {
+				t.Errorf("the message %q does not name the directory %s on one line", err, dir)
+			}
+			if after := tree(t, dir); !slices.Equal(after, before) {
+				t.Errorf("the directory holds %q after the Open, it held %q", after, before)
+			}
+		})
+	}
+
+	// What an Open leaves that was killed before it wrote the origin is no
+	// reason to refuse the directory for ever.
+	for name, files := range map[string][]string{
+		"an empty directory":          nil,
+		"a lock":                      {"lock"},
+		"an Open killed at its start": {"lock", "packs/.probe", "refs/.probe", "staging/.probe", "tmp/.probe", "tmp/new-123456"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, f := range files {
+				write(t, filepath.Join(dir, filepath.FromSlash(f)))
+			}
+			c := open(t, dir, roomy)
+			root := place(t, c, nil, body("first", 10))
+			wantPresent(t, c, root, true)
+			wantNames(t, dir, "lock", "origin", "packs", "refs", "staging", "tmp")
+			wantNames(t, filepath.Join(dir, "tmp"))
+			wantNames(t, filepath.Join(dir, "staging"))
+		})
+	}
+
+	// With its origin file a directory is the cache's, whatever lies
+	// beside its own.
+	dir := t.TempDir()
+	open(t, dir, roomy).Close()
+	write(t, filepath.Join(dir, "notes.txt"))
+	open(t, dir, roomy).Close()
+	if _, err := os.Stat(filepath.Join(dir, "notes.txt")); err != nil {
+		t.Errorf("a file beside the cache's own: %v", err)
+	}
+}
+
+// A pack placed under a reserved root is the reservation's from then on,
+// whether it was read through it or not: when it is dropped, the
+// reservation reads it all the same. The one who makes a reference local
+// reads its packs only after all of them are there.
+func TestReservationKeepsAPackItHasNotRead(t *testing.T) {
+	dir := t.TempDir()
+	c := open(t, dir, roomy)
+	object := body("placed and dropped", 3000)
+	root := blob(t, object)
+	h := c.Reserve(root)
+	place(t, c, nil, object)
+
+	c.Drop(root)
+	wantPresent(t, c, root, false)
+	wantNames(t, filepath.Join(dir, "packs"))
+	wantObject(t, h, object)
+	if has, err := h.Has(root); err != nil || !has {
+		t.Fatalf("Has through the reservation = %v, %v, want true", has, err)
+	}
+
+	// The same for the pack placed in its stead.
+	second := body("only in the second pack", 2000)
+	if err := c.Place(seal(t, c, object, second), root, nil); err != nil {
+		t.Fatal(err)
+	}
+	c.Drop(root)
+	wantObject(t, h, second)
+
+	h.Release()
+	wantNames(t, filepath.Join(dir, "tmp"))
+}
+
+// A read through a reservation does not wait for the lock of the cache,
+// whether or not there is a pack under each of its roots: every object of
+// a patch whose parent is still on its way is read so.
+func TestReservationReadsWithoutTheCacheLock(t *testing.T) {
+	c := open(t, t.TempDir(), roomy)
+	object := body("own", 100)
+	root := place(t, c, nil, object)
+	h := c.Reserve(blob(t, body("not there yet", 10)), root, blob(t, body("never there", 10)))
+	defer h.Release()
+
+	c.mu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.Get(root)
+		if err == nil {
+			_, err = h.Has(blob(t, body("in no pack", 10)))
+		}
+		done <- err
+	}()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(5 * time.Second):
+		err = errors.New("the read waits for the lock of the cache")
+	}
+	c.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The list of open files holds the files that are open, each once, also
+// when files are removed while they are being opened.
+func TestFileIsListedAsItIsOpened(t *testing.T) {
+	c := open(t, t.TempDir(), roomy)
+	object := body("read and removed", 64)
+	s := seal(t, c, object)
+	fl := s.flat
+
+	// With the list in the test's hand, a read opens the files and then
+	// waits to enter them. It has come that far when the files are open,
+	// or when it keeps the file's lock for longer than opening takes.
+	c.openMu.Lock()
+	listed := false
+	defer func() {
+		if !listed {
+			c.openMu.Unlock()
+		}
+	}()
+	read := make(chan error, 1)
+	go func() {
+		_, err := s.Get(blob(t, object))
+		read <- err
+	}()
+	for busy := 0; busy < 100; time.Sleep(time.Millisecond) {
+		if !fl.mu.TryRLock() {
+			busy++
+			continue
+		}
+		opened := fl.f != nil
+		fl.mu.RUnlock()
+		if opened {
+			break
+		}
+		busy = 0
+	}
+
+	// A removal now must wait until the files are in the list. One that
+	// goes ahead finds nothing to take out of it, and the list is left
+	// with a file that is gone.
+	removed := make(chan struct{})
+	go func() {
+		s.Discard()
+		close(removed)
+	}()
+	for end := time.Now().Add(200 * time.Millisecond); time.Now().Before(end); time.Sleep(time.Millisecond) {
+		if !fl.mu.TryRLock() {
+			continue
+		}
+		gone := fl.gone
+		fl.mu.RUnlock()
+		if gone {
+			t.Fatal("the file was removed between its opening and its entry in the list of open files")
+		}
+	}
+
+	c.openMu.Unlock()
+	listed = true
+	<-read
+	<-removed
+	c.openMu.Lock()
+	defer c.openMu.Unlock()
+	if len(c.open) != 0 {
+		t.Fatalf("%d files are listed as open after the only one was removed", len(c.open))
+	}
+}
+
+// A closed cache changes nothing in its directory, which may be another
+// process's by then: neither do the files that were out when it closed.
+func TestClosedCacheLeavesItsFiles(t *testing.T) {
+	dir := t.TempDir()
+	c := open(t, dir, roomy)
+	w, err := c.NewStaged()
+	if err != nil {
+		t.Fatal(err)
+	}
+	object := body("staged", 10)
+	if err := w.Add(blob(t, object), object); err != nil {
+		t.Fatal(err)
+	}
+	sealed, placed := seal(t, c, body("sealed", 10)), seal(t, c, body("to be placed", 10))
+	staging, tmp := names(t, filepath.Join(dir, "staging")), names(t, filepath.Join(dir, "tmp"))
+	if len(staging) != 1 || len(tmp) != 4 {
+		t.Fatalf("staging holds %q and tmp %q, want one file and four", staging, tmp)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	w.Discard()
+	sealed.Discard()
+	if err := c.Place(placed, blob(t, body("to be placed", 10)), nil); err == nil {
+		t.Error("Place on a closed cache succeeded")
+	}
+	wantNames(t, filepath.Join(dir, "staging"), staging...)
+	wantNames(t, filepath.Join(dir, "tmp"), tmp...)
+	wantNames(t, filepath.Join(dir, "packs"))
+	if _, err := sealed.Get(blob(t, body("sealed", 10))); err == nil {
+		t.Error("a sealed file is read after its Discard")
+	}
+	if err := w.Add(blob(t, object), object); err == nil {
+		t.Error("a writer takes an object after its Discard")
+	}
+
+	// The next Open clears them away.
+	c = open(t, dir, roomy)
+	wantNames(t, filepath.Join(dir, "staging"))
+	wantNames(t, filepath.Join(dir, "tmp"))
 }
