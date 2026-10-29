@@ -1297,6 +1297,72 @@ func TestServeCutsRequestsThatDoNotFinish(t *testing.T) {
 	}
 }
 
+// lingering is a listener whose connections stay open for a while after
+// they were closed, which makes a request that is cut take that while to
+// notice.
+type lingering struct {
+	net.Listener
+	wait time.Duration
+}
+
+func (l lingering) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return lingeringConn{conn, l.wait}, nil
+}
+
+type lingeringConn struct {
+	net.Conn
+	wait time.Duration
+}
+
+func (c lingeringConn) Close() error {
+	time.AfterFunc(c.wait, func() { c.Conn.Close() })
+	return nil
+}
+
+// A request that was cut stands on the uploader and the cache until it has
+// ended, and serve closes neither before that.
+func TestServeWaitsForTheRequestsItCut(t *testing.T) {
+	clearEnvironment(t)
+	noNix(t)
+	srv := testserver.Start(t, testserver.Options{})
+	opts := testOptions(t, t.TempDir())
+	const lingers = 500 * time.Millisecond
+	h := hostOf(srv, 100*time.Millisecond)
+	h.listen = func(address string) (net.Listener, error) {
+		ln, err := net.Listen("tcp", address)
+		return lingering{ln, lingers}, err
+	}
+	d := startServe(t, opts, h)
+	p := newTestPath(t, strings.Repeat("a request that ends late\n", 4000))
+
+	body, feed := io.Pipe()
+	defer feed.Close()
+	go d.do(http.MethodPut, "/nar/"+p.narHash+".nar", body)
+	if _, err := feed.Write(p.archive[:len(p.archive)/2]); err != nil {
+		t.Fatal(err)
+	}
+	uploading(t, opts.CacheDir)
+
+	began := time.Now()
+	if err := d.stop(); err != nil {
+		t.Errorf("serve returned %v", err)
+	}
+	if took := time.Since(began); took < lingers {
+		t.Errorf("serve returned after %v, before the request it cut can have ended", took)
+	}
+	// The request has taken back what it staged, which it does as it ends.
+	if names := files(t, opts.CacheDir, "staging"); len(names) != 0 {
+		t.Errorf("staging holds %v when serve has returned: the upload that was cut had not ended", names)
+	}
+	if d.logged("requests that were still running have been cut") != 1 {
+		t.Errorf("serve does not say that it cut a request:\n%s", d.log.String())
+	}
+}
+
 // eventually waits until cond holds.
 func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
