@@ -809,6 +809,11 @@ func TestAdmit(t *testing.T) {
 		t.Fatal(err)
 	}
 	pack := func(root key.Key, bytes uint64) client.Pack { return client.Pack{Root: root, Bytes: bytes} }
+	// many is a pack of the given number of objects, most of them empty,
+	// with the index that goes with them.
+	many := func(root key.Key, objects uint64) client.Pack {
+		return client.Pack{Root: root, Objects: objects, Bytes: 13, DataSize: 30, IndexSize: packfile.IndexSize(objects)}
+	}
 
 	for _, c := range []struct {
 		name  string
@@ -825,6 +830,11 @@ func TestAdmit(t *testing.T) {
 		{"narinfo, packs of 4 MiB", kindNarinfo, blob, []client.Pack{pack(blob, 100), pack(other, 4<<20-100)}, true},
 		{"narinfo, packs over 4 MiB", kindNarinfo, blob, []client.Pack{pack(blob, 100), pack(other, 4<<20-99)}, false},
 		{"narinfo, sizes that wrap around", kindNarinfo, blob, []client.Pack{pack(blob, 1<<63), pack(other, 1<<63)}, false},
+		{"narinfo, a pack of 1024 objects", kindNarinfo, blob, []client.Pack{many(blob, 1024)}, true},
+		{"narinfo, a pack of 1025 objects", kindNarinfo, blob, []client.Pack{many(blob, 1025)}, false},
+		{"narinfo, a parent pack of 1025 objects", kindNarinfo, blob, []client.Pack{pack(blob, 100), many(other, 1025)}, false},
+		{"narinfo, an index of 704 MiB for 13 bytes of objects", kindNarinfo, blob, []client.Pack{many(blob, packfile.MaxEntries)}, false},
+		{"content, a pack of very many objects", kindContent, leaf, []client.Pack{many(leaf, packfile.MaxEntries)}, true},
 		{"content, a directory", kindContent, leaf, []client.Pack{pack(leaf, 1<<40)}, true},
 		{"content, a directory index", kindContent, dirNode, []client.Pack{pack(dirNode, 1<<40), pack(leaf, 1<<40)}, true},
 		{"content, a blob", kindContent, blob, []client.Pack{pack(blob, 100)}, false},
@@ -889,6 +899,28 @@ func TestNarinfoForAnotherPath(t *testing.T) {
 	f.pushNarinfo(textOf(t, xz, asNix))
 	_, err = f.store.Narinfo(background(t), xz)
 	notFound(t, "Narinfo with the URL of a compressed file", err)
+
+	// Each of the two alone is as little what narrenhaus stores: the URL
+	// of another NAR than the one the narinfo is of, and a compression
+	// that the NAR behind the URL does not have.
+	elsewhere := ingested(t, archive(t, smallTree(2)))
+	for what, lines := range map[string]string{
+		"the URL of another NAR":        fmt.Sprintf("URL: nar/%s.nar\nCompression: none\n", elsewhere.hash),
+		"a compression other than none": fmt.Sprintf("URL: nar/%s.nar\nCompression: xz\n", content.hash),
+	} {
+		hash := storeHash(what)
+		wrong := fmt.Appendf(nil, "StorePath: /nix/store/%s-wrong\n%sNarHash: sha256:%s\nNarSize: %d\nReferences: \n",
+			hash, lines, content.hash, content.size)
+		if _, err := narinfo.Parse(wrong); err != nil {
+			t.Fatalf("the narinfo of the test with %s: %v", what, err)
+		}
+		f.pushNarinfo(textOf(t, hash, wrong))
+		_, err = f.store.Narinfo(background(t), hash)
+		notFound(t, "Narinfo with "+what, err)
+		if !f.log.has("level=ERROR", f.store.NarinfoName(hash)) {
+			t.Errorf("the narinfo with %s is not in the log as an error", what)
+		}
+	}
 
 	// A text that is no narinfo.
 	junk := storeHash("junk")
@@ -1988,8 +2020,8 @@ func TestDamagedCacheIsFetchedAgain(t *testing.T) {
 func TestBrokenIsJudgedOnFetchedPacks(t *testing.T) {
 	// A pack in the cache that lacks an object of its tree, as no
 	// download leaves one: the reference on the server is sound. It is
-	// not called broken for what the cache holds. The pack is dropped,
-	// and the next request fetches it.
+	// not called broken for what the cache holds. The pack is dropped
+	// and fetched, and the request that found it so is served.
 	f := newFixture(t, config{})
 	r := ingested(t, archive(t, smallTree(1)))
 	f.pushContent(r)
@@ -2016,21 +2048,36 @@ func TestBrokenIsJudgedOnFetchedPacks(t *testing.T) {
 	hold.Release()
 	f.bucket.forget()
 
-	_, err = f.store.Content(background(t), r.hash)
-	notFound(t, "Content from a cached pack that lacks an object", err)
-	if n := f.bucket.gets(""); n != 0 {
-		t.Errorf("%d downloads for a pack that was cached", n)
-	}
-	if _, ok := f.cache.Meta(r.root); ok {
-		t.Error("the pack that lacks an object is still cached")
-	}
+	f.serves(r)
 	if f.log.has("level=ERROR") {
 		t.Error("a reference is called broken for what the cache holds")
 	}
-	f.serves(r)
+	if !f.log.has("level=WARN", f.store.ContentName(r.hash)) {
+		t.Error("the pack that was dropped is not in the log")
+	}
 	if n := f.bucket.gets(".data", r.root); n != 1 {
 		t.Errorf("%d downloads of the pack, want one", n)
 	}
+
+	// A reference that is broken on the server is judged all the same,
+	// once the pack that was cached has been fetched: here the cached pack
+	// is whole, and the reference's recipe is none.
+	broken, brokenRoot := f.withoutRecipe(r, "broken, with its parent cached")
+	_, err = f.store.Content(background(t), broken)
+	notFound(t, "Content of a broken patch of a cached pack", err)
+	if !f.log.has("level=ERROR", f.store.ContentName(broken)) {
+		t.Error("the broken reference is not in the log as an error")
+	}
+	if _, ok := f.cache.Meta(brokenRoot); ok {
+		t.Error("the pack of the broken reference is still cached")
+	}
+	if meta, ok := f.cache.Meta(r.root); !ok || !meta.Complete {
+		t.Errorf("the parent of the broken reference is cached as %+v (%v), want it kept", meta, ok)
+	}
+	if n := f.bucket.gets(".data", r.root); n != 2 {
+		t.Errorf("%d downloads of the parent, want one more to pass the verdict on", n)
+	}
+	f.serves(r)
 }
 
 func TestCloseEndsTheWork(t *testing.T) {
@@ -2107,5 +2154,825 @@ func TestStoreContextEndsTheWork(t *testing.T) {
 		notFound(t, "Content when the store's context ends", err)
 	case <-time.After(10 * time.Second):
 		t.Fatal("the request did not return when the store's context ended")
+	}
+}
+
+// corruptPatch pushes r, a patch, under the name of its hash with one
+// object of its own pack that is not what its key says.
+func (f *fixture) corruptPatch(r, parent *reference) {
+	f.t.Helper()
+	var victim key.Key
+	for k := range r.objs.m {
+		if _, shared := parent.objs.m[k]; shared || k.Type() != key.Blob {
+			continue
+		}
+		if k.Length() > victim.Length() || (k.Length() == victim.Length() && bytes.Compare(k[:], victim[:]) > 0) {
+			victim = k
+		}
+	}
+	if victim.Length() < 1024 {
+		f.t.Fatalf("the largest blob of the patch has %d bytes", victim.Length())
+	}
+	if res := f.push(f.store.ContentName(r.hash), r.root, corrupting{r.objs, victim}, 0.5); res.Parent == nil || *res.Parent != parent.root {
+		f.t.Fatalf("the corrupt reference was pushed with parent %v, want a patch of %s", res.Parent, parent.root)
+	}
+}
+
+// withoutRecipe pushes a reference with the tree of base and a recipe that
+// is none, a patch of base that is found broken only when it is checked,
+// and returns the hash it is named by and its root.
+func (f *fixture) withoutRecipe(base *reference, seed string) (hash string, root key.Key) {
+	f.t.Helper()
+	broken := base.wrapped(f.t, []byte("not a recipe"))
+	sum := sha256.Sum256([]byte(seed))
+	hash = nix32.Encode(sum[:])
+	if res := f.push(f.store.ContentName(hash), broken.root, broken.objs, 0.5); res.Parent == nil || *res.Parent != base.root {
+		f.t.Fatalf("the reference without a recipe was pushed with parent %v, want a patch of %s", res.Parent, base.root)
+	}
+	return hash, broken.root
+}
+
+// checksBusy takes every place of a check, as eight checks under way do,
+// and returns how to give n of them back.
+func (f *fixture) checksBusy() (free func(n int)) {
+	f.t.Helper()
+	for range cap(f.store.checkPlaces) {
+		f.store.checkPlaces <- struct{}{}
+	}
+	left := cap(f.store.checkPlaces)
+	free = func(n int) {
+		for ; n > 0 && left > 0; n, left = n-1, left-1 {
+			<-f.store.checkPlaces
+		}
+	}
+	f.t.Cleanup(func() { free(left) })
+	return free
+}
+
+// asked asks for the content of hash on a goroutine of its own and gives
+// the archive that was served.
+type answer struct {
+	archive []byte
+	err     error
+}
+
+func (f *fixture) asked(hash string) <-chan answer {
+	out := make(chan answer, 1)
+	go func() {
+		c, err := f.store.Content(background(f.t), hash)
+		if err != nil {
+			out <- answer{err: err}
+			return
+		}
+		defer c.Release()
+		var buf bytes.Buffer
+		_, err = c.WriteTo(&buf)
+		out <- answer{archive: buf.Bytes(), err: err}
+	}()
+	return out
+}
+
+// served fails the test unless a is the archive of r.
+func (f *fixture) served(what string, r *reference, a answer) {
+	f.t.Helper()
+	if a.err != nil {
+		f.t.Fatalf("%s is not served: %v", what, a.err)
+	}
+	if !bytes.Equal(a.archive, r.archive) {
+		f.t.Fatalf("%s: %d bytes were served that are not the archive of %d bytes", what, len(a.archive), len(r.archive))
+	}
+}
+
+// A sound reference and a broken one that are patches of one parent, asked
+// for at once, as Nix asks for the paths of a closure. The sound one has
+// its packs and waits for its check while the broken one is judged.
+func TestBrokenSiblingDoesNotCondemnASoundReference(t *testing.T) {
+	f := newFixture(t, config{server: testserver.Options{NoVerify: true}})
+	v1, x := patched(t, 1, 4)
+	_, y := patched(t, 1, 5)
+	f.pushContent(v1)
+	if res := f.pushContent(x); res.Parent == nil || *res.Parent != v1.root {
+		t.Fatal("x is no patch of v1")
+	}
+	f.corruptPatch(y, v1)
+	f.bucket.forget()
+
+	free := f.checksBusy()
+	sound := f.asked(x.hash)
+	eventually(t, "x has both packs local and waits for its check", func() bool {
+		_, own := f.cache.Meta(x.root)
+		_, parent := f.cache.Meta(v1.root)
+		return own && parent
+	})
+
+	_, err := f.store.Content(background(t), y.hash)
+	notFound(t, "Content of the broken sibling", err)
+	if !f.log.has("level=ERROR", f.store.ContentName(y.hash)) {
+		t.Error("the broken sibling is not in the log as an error")
+	}
+	if _, ok := f.cache.Meta(v1.root); !ok {
+		t.Error("the parent, which the sound reference reads, was dropped with the broken one")
+	}
+
+	free(cap(f.store.checkPlaces))
+	f.served("the sound reference, asked for while its sibling was judged", x, <-sound)
+	if f.log.has("level=ERROR", f.store.ContentName(x.hash)) {
+		t.Error("the sound reference is in the log as broken")
+	}
+	f.serves(x)
+	if n := f.bucket.gets(".data", v1.root); n != 1 {
+		t.Errorf("%d downloads of the parent, want one", n)
+	}
+}
+
+// A broken patch of a parent that is cached is not judged on the cached
+// pack: the parent is dropped and fetched again, under whoever reads it,
+// and then the verdict is passed, all within the one request. A sound
+// patch of the same parent that is being made local meanwhile is served.
+func TestDeferredVerdictIsPassedInTheSameWork(t *testing.T) {
+	f := newFixture(t, config{})
+	v1, x := patched(t, 1, 4)
+	f.pushContent(v1)
+	if res := f.pushContent(x); res.Parent == nil || *res.Parent != v1.root {
+		t.Fatal("x is no patch of v1")
+	}
+	broken, brokenRoot := f.withoutRecipe(v1, "the broken sibling")
+	f.serves(v1)
+	f.bucket.forget()
+
+	// Both have their packs and wait for a check, the broken one first.
+	free := f.checksBusy()
+	judged := f.asked(broken)
+	eventually(t, "the broken reference has its pack", func() bool { _, ok := f.cache.Meta(brokenRoot); return ok })
+	sound := f.asked(x.hash)
+	eventually(t, "x has its pack", func() bool { _, ok := f.cache.Meta(x.root); return ok })
+	free(1)
+
+	notFound(t, "Content of the broken reference", (<-judged).err)
+	if !f.log.has("level=ERROR", f.store.ContentName(broken)) {
+		t.Error("the broken reference was not judged in the request that found it: it is not in the log as an error")
+	}
+	f.served("the sound sibling, asked for while the parent was dropped and fetched again", x, <-sound)
+	if f.log.has("level=ERROR", f.store.ContentName(x.hash)) {
+		t.Error("the sound reference is in the log as broken")
+	}
+	if meta, ok := f.cache.Meta(v1.root); !ok || !meta.Complete {
+		t.Errorf("the parent is cached as %+v (%v), want it there", meta, ok)
+	}
+	if n := f.bucket.gets(".data", v1.root); n != 1 {
+		t.Errorf("%d downloads of the parent to pass the verdict, want one", n)
+	}
+
+	// It is remembered, and the parent is not dropped for it a second time.
+	downloads := f.bucket.gets("")
+	_, err := f.store.Content(background(t), broken)
+	notFound(t, "Content of the broken reference, again", err)
+	f.serves(v1)
+	f.serves(x)
+	if n := f.bucket.gets(""); n != downloads {
+		t.Errorf("%d downloads after the verdict, want the %d before", n, downloads)
+	}
+}
+
+// A pack that is dropped under a reference that has it and is not served
+// yet is fetched again by the work on that reference; the request is not
+// told that there is nothing.
+func TestPackDroppedUnderAReferenceIsFetchedAgain(t *testing.T) {
+	t.Run("the parent of a patch", func(t *testing.T) {
+		f := newFixture(t, config{})
+		v1, x := patched(t, 1, 4)
+		f.pushContent(v1)
+		f.pushContent(x)
+		f.bucket.forget()
+
+		free := f.checksBusy()
+		sound := f.asked(x.hash)
+		eventually(t, "x has both packs local and waits for its check", func() bool {
+			_, own := f.cache.Meta(x.root)
+			_, parent := f.cache.Meta(v1.root)
+			return own && parent
+		})
+		f.cache.Drop(v1.root)
+		free(1)
+
+		f.served("the patch whose parent was dropped", x, <-sound)
+		if f.log.has("level=ERROR") {
+			t.Error("a reference whose parent was dropped is in the log as an error")
+		}
+		if n := f.bucket.gets(".data", v1.root); n != 2 {
+			t.Errorf("%d downloads of the parent, want the one that was dropped and one more", n)
+		}
+	})
+	t.Run("its own pack", func(t *testing.T) {
+		f := newFixture(t, config{})
+		v1, x := patched(t, 1, 4)
+		f.pushContent(v1)
+		f.pushContent(x)
+		// The parent is cached for the patch; its own reference has not
+		// been checked.
+		f.serves(x)
+		f.bucket.forget()
+
+		free := f.checksBusy()
+		base := f.asked(v1.hash)
+		eventually(t, "the work on the base's own reference has begun", func() bool {
+			f.store.mu.Lock()
+			defer f.store.mu.Unlock()
+			return len(f.store.jobs) == 1
+		})
+		// It has its pack, which was cached, and waits for its check.
+		time.Sleep(100 * time.Millisecond)
+		f.cache.Drop(v1.root)
+		free(1)
+
+		f.served("the reference whose pack was dropped", v1, <-base)
+		if f.log.has("level=ERROR") {
+			t.Error("a reference whose pack was dropped is in the log as an error")
+		}
+		if n := f.bucket.gets(".data", v1.root); n != 1 {
+			t.Errorf("%d downloads of the pack that was dropped, want one", n)
+		}
+	})
+}
+
+// altered changes the cached pack of root on disk without changing its
+// size: change is given the bytes of the data file.
+func (f *fixture) altered(root key.Key, change func(data []byte)) {
+	f.t.Helper()
+	path := filepath.Join(filepath.Dir(f.cache.TempDir()), "packs", root.String()+".data")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	change(data)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// A pack whose bytes changed on disk under an unchanged size, as after a
+// crash of the system, is not served: no NAR that is complete and wrong,
+// and no narinfo with another text, which narrenhaus would sign.
+func TestAlteredCacheIsNotServed(t *testing.T) {
+	body := noise(1, 100<<10)
+	for name, change := range map[string]func(t *testing.T, data []byte){
+		"a byte of a file": func(t *testing.T, data []byte) {
+			at := bytes.Index(data, body[:4096])
+			if at < 0 {
+				t.Fatal("the file is not in the pack")
+			}
+			data[at+2000] ^= 0xff
+		},
+		"a block of a file that reads as zeroes": func(t *testing.T, data []byte) {
+			at := bytes.Index(data, body[:4096])
+			if at < 0 {
+				t.Fatal("the file is not in the pack")
+			}
+			start := (at + 8192) &^ 4095
+			clear(data[start : start+4096])
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, config{})
+			r := ingested(t, archive(t, smallTree(1)))
+			f.pushContent(r)
+			f.serves(r)
+			f.altered(r.root, func(data []byte) { change(t, data) })
+			f.bucket.forget()
+
+			// The first request finds it out while it writes: what went
+			// out is a beginning of the archive, cut short.
+			c, err := f.store.Content(background(t), r.hash)
+			if err == nil {
+				var buf bytes.Buffer
+				n, err := c.WriteTo(&buf)
+				c.Release()
+				if err == nil {
+					t.Fatalf("WriteTo wrote %d bytes of an altered pack without an error; they are the archive: %v", n, bytes.Equal(buf.Bytes(), r.archive))
+				}
+				if buf.Len() >= len(r.archive) || !bytes.HasPrefix(r.archive, buf.Bytes()) {
+					t.Errorf("%d bytes were written that are no beginning of the archive cut short", buf.Len())
+				}
+				if !f.log.has("level=ERROR", f.store.ContentName(r.hash)) {
+					t.Error("the altered pack is not in the log")
+				}
+			} else {
+				notFound(t, "Content from an altered pack", err)
+			}
+			// The next one has it fetched again.
+			f.serves(r)
+			if n := f.bucket.gets(".data", r.root); n != 1 {
+				t.Errorf("%d downloads of the pack, want one", n)
+			}
+		})
+	}
+
+	t.Run("a byte of the parent of a patch", func(t *testing.T) {
+		// The file that changed is one the patch reads from its parent.
+		// What cuts the NAR drops the patch; the work that makes it
+		// local again finds which pack it was.
+		f := newFixture(t, config{})
+		v1, v2 := patched(t, 1, 4)
+		f.pushContent(v1)
+		if res := f.pushContent(v2); res.Parent == nil || *res.Parent != v1.root {
+			t.Fatal("the second version is no patch of the first")
+		}
+		f.serves(v2)
+		f.altered(v1.root, func(data []byte) {
+			at := bytes.Index(data, noise(1, 128<<10)[:4096])
+			if at < 0 {
+				t.Fatal("the file is not in the parent's pack")
+			}
+			data[at+2000] ^= 0xff
+		})
+		f.bucket.forget()
+
+		c, err := f.store.Content(background(t), v2.hash)
+		if err != nil {
+			t.Fatalf("Content: %v", err)
+		}
+		var buf bytes.Buffer
+		_, err = c.WriteTo(&buf)
+		c.Release()
+		if err == nil || buf.Len() >= len(v2.archive) || !bytes.HasPrefix(v2.archive, buf.Bytes()) {
+			t.Fatalf("WriteTo wrote %d bytes of an altered pack, error %v, want a beginning of the archive and an error", buf.Len(), err)
+		}
+		f.serves(v2)
+		if a, b := f.bucket.gets(".data", v2.root), f.bucket.gets(".data", v1.root); a != 1 || b != 1 {
+			t.Errorf("%d downloads of the patch and %d of the parent, want one each", a, b)
+		}
+		if f.log.has("level=ERROR", "broken reference") {
+			t.Error("a reference is called broken for what the cache holds")
+		}
+		f.serves(v1)
+	})
+
+	t.Run("a digit of a narinfo", func(t *testing.T) {
+		f := newFixture(t, config{})
+		r := ingested(t, archive(t, smallTree(1)))
+		hash := storeHash("one")
+		info := narinfoOf(t, hash, "one", r)
+		f.pushNarinfo(info)
+		if _, err := f.store.Narinfo(background(t), hash); err != nil {
+			t.Fatal(err)
+		}
+		f.altered(info.root, func(data []byte) {
+			at := bytes.Index(data, []byte("NarSize: "))
+			if at < 0 {
+				t.Fatal("no NarSize in the pack")
+			}
+			if digit := &data[at+len("NarSize: ")]; *digit == '9' {
+				*digit = '8'
+			} else {
+				*digit++
+			}
+		})
+		f.bucket.forget()
+
+		eventually(t, "the narinfo is served again", func() bool {
+			got, err := f.store.Narinfo(background(t), hash)
+			if err != nil {
+				notFound(t, "Narinfo from an altered pack", err)
+				return false
+			}
+			if !bytes.Equal(got.Stored(), info.text) {
+				t.Fatalf("an altered narinfo was served, with NarSize %d for %d", got.NarSize, r.size)
+			}
+			return true
+		})
+		if n := f.bucket.gets(".data", info.root); n != 1 {
+			t.Errorf("%d downloads of the narinfo's pack, want one", n)
+		}
+		if !f.log.has("level=WARN", f.store.NarinfoName(hash)) {
+			t.Error("the altered pack is not in the log")
+		}
+	})
+}
+
+// doubled returns the node of a directory that holds the directory below
+// it twice, levels deep, with the objects it is made of and the length of
+// its archive: a tree of a few dozen objects for an archive of 2^levels
+// nodes.
+func doubled(t *testing.T, levels int) (node nartree.Node, objs *objects, size uint64) {
+	t.Helper()
+	objs = newObjects()
+	entry := func(name string, k key.Key) fstree.Entry {
+		return fstree.Entry{Name: []byte(name), Mode: 0o040555, Mtime: 1_000_000_000, ContentKey: k[:]}
+	}
+	leaf, err := fstree.EncodeDirLeaf(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objs.emit(leaf)
+	// The lengths of the first archives are measured, those of the rest
+	// follow: an archive is its two halves and what a directory adds.
+	var sizes []uint64
+	k := leaf.Key
+	for level := 0; ; level++ {
+		if level <= 3 {
+			var n counter
+			if err := nartree.WriteNAR(&n, entry("nar", k), objs.Get); err != nil {
+				t.Fatal(err)
+			}
+			sizes = append(sizes, uint64(n))
+		} else {
+			sizes = append(sizes, 2*sizes[level-1]+sizes[1]-2*sizes[0])
+		}
+		if level == levels {
+			break
+		}
+		dir, err := fstree.EncodeDirLeaf([]fstree.Entry{entry("a", k), entry("b", k)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		objs.emit(dir)
+		k = dir.Key
+	}
+	for level := 2; level <= 3; level++ {
+		if want := 2*sizes[level-1] + sizes[1] - 2*sizes[0]; sizes[level] != want {
+			t.Fatalf("the archive of %d levels has %d bytes, the test reckons %d", level, sizes[level], want)
+		}
+	}
+	return entry("nar", k), objs, sizes[levels]
+}
+
+// counter counts the bytes written to it.
+type counter uint64
+
+func (c *counter) Write(p []byte) (int, error) {
+	*c += counter(len(p))
+	return len(p), nil
+}
+
+// A reference of a few dozen objects whose archive would take years to
+// write is refused before it takes a check's place for longer than a
+// moment: by the length its recipe states, or, where the recipe lies
+// about that, at the first byte beyond it.
+func TestArchiveThatIsTooLargeIsNotRebuilt(t *testing.T) {
+	f := newFixture(t, config{})
+	node, objs, size := doubled(t, 41)
+	if size <= nartree.MaxNARSize {
+		t.Fatalf("the archive has %d bytes, the test wants one above the limit", size)
+	}
+	t.Logf("a reference of %d objects states an archive of %d bytes (%d TiB)", len(objs.m)+2, size, size>>40)
+
+	// More of them than there are places for checks.
+	var names []string
+	for i := range 2 * cap(f.store.checkPlaces) {
+		sum := sha256.Sum256(fmt.Append(nil, "bomb ", i))
+		stated := size
+		if i%2 == 1 {
+			stated = 1 << 20
+		}
+		o := objs.clone()
+		root, err := nartree.Root(node, sum, stated, o.emit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hash := nix32.Encode(sum[:])
+		f.push(f.store.ContentName(hash), root, o, 0.5)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_, err = f.store.Content(ctx, hash)
+		cancel()
+		notFound(t, "Content of an archive bomb", err)
+		names = append(names, f.store.ContentName(hash))
+	}
+	for i, name := range names {
+		if !f.log.has("level=ERROR", name) {
+			t.Errorf("bomb %d was not refused: it is not in the log as an error", i)
+		}
+	}
+	f.store.mu.Lock()
+	running := len(f.store.jobs)
+	f.store.mu.Unlock()
+	if running != 0 || len(f.store.checkPlaces) != 0 {
+		t.Errorf("%d references are still being made local and %d checks run", running, len(f.store.checkPlaces))
+	}
+
+	honest := ingested(t, archive(t, smallTree(1)))
+	f.pushContent(honest)
+	f.serves(honest)
+}
+
+// A reference whose packs are larger than the cache's limit, made local
+// after its request gave up, is still there for the next request.
+func TestReferenceMadeLocalWithoutItsRequestIsKept(t *testing.T) {
+	f := newFixture(t, config{limit: 1})
+	v1, v2 := patched(t, 1, 4)
+	f.pushContent(v1)
+	if res := f.pushContent(v2); res.Parent == nil {
+		t.Fatal("the second version is no patch")
+	}
+	f.bucket.forget()
+	// The connection is up before the short wait begins.
+	if ok, err := f.store.HasNarinfo(background(t), storeHash("nothing")); ok || err != nil {
+		t.Fatalf("HasNarinfo = %v, %v", ok, err)
+	}
+	f.srv.SlowBucket(300 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := f.store.Content(ctx, v2.hash)
+	notFound(t, "Content with a wait of 50 ms", err)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("the error %v does not say that the wait ended", err)
+	}
+	eventually(t, "the work has ended", func() bool {
+		f.store.mu.Lock()
+		defer f.store.mu.Unlock()
+		return len(f.store.jobs) == 0
+	})
+	if rec, ok := f.cache.Record(f.store.ContentName(v2.hash)); !ok || !rec.Checked {
+		t.Fatalf("after the work ended the record is %+v (%v): the reference was evicted as soon as it was made local", rec, ok)
+	}
+	for _, root := range []key.Key{v2.root, v1.root} {
+		if _, ok := f.cache.Meta(root); !ok {
+			t.Errorf("the pack of %s is not cached after the work ended", root)
+		}
+	}
+
+	// The next request is served from what the first one began, and when
+	// it is over the cache is within its limit again.
+	f.srv.SlowBucket(0)
+	f.serves(v2)
+	if n := f.bucket.gets(".data"); n != 2 {
+		t.Errorf("%d data downloads in all, want the two packs once each", n)
+	}
+	if size := f.cache.Size(); size != 0 {
+		t.Errorf("the cache holds %d bytes after the request, the limit is 1", size)
+	}
+}
+
+// What is kept for a request that never comes is let go of when its time
+// is over, and when the store is closed: the cache returns to its limit.
+func TestKeptReferenceIsLetGo(t *testing.T) {
+	// abandoned asks for r with a wait too short for the download, and
+	// returns when the work has ended without a request.
+	abandoned := func(t *testing.T, f *fixture, r *reference) {
+		t.Helper()
+		if ok, err := f.store.HasNarinfo(background(t), storeHash("nothing")); ok || err != nil {
+			t.Fatalf("HasNarinfo = %v, %v", ok, err)
+		}
+		f.srv.SlowBucket(300 * time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		_, err := f.store.Content(ctx, r.hash)
+		notFound(t, "Content with a wait of 50 ms", err)
+		eventually(t, "the work has ended", func() bool {
+			f.store.mu.Lock()
+			defer f.store.mu.Unlock()
+			return len(f.store.jobs) == 0
+		})
+		f.srv.SlowBucket(0)
+	}
+
+	t.Run("after its time", func(t *testing.T) {
+		f := newFixture(t, config{limit: 1})
+		f.store.keep = 2 * time.Second
+		r := ingested(t, archive(t, smallTree(1)))
+		f.pushContent(r)
+		f.bucket.forget()
+		abandoned(t, f, r)
+		if _, ok := f.cache.Meta(r.root); !ok {
+			t.Fatal("the pack is not cached after the work ended")
+		}
+		eventually(t, "the cache is within its limit", func() bool { return f.cache.Size() == 0 })
+		f.store.mu.Lock()
+		kept := len(f.store.kept)
+		f.store.mu.Unlock()
+		if kept != 0 {
+			t.Errorf("%d references are kept after their time", kept)
+		}
+		// It is fetched again when it is asked for after all.
+		f.serves(r)
+		if n := f.bucket.gets(".data", r.root); n != 2 {
+			t.Errorf("%d downloads of the pack, want two", n)
+		}
+	})
+	t.Run("when the store is closed", func(t *testing.T) {
+		f := newFixture(t, config{limit: 1})
+		r := ingested(t, archive(t, smallTree(1)))
+		f.pushContent(r)
+		abandoned(t, f, r)
+		if _, ok := f.cache.Meta(r.root); !ok {
+			t.Fatal("the pack is not cached after the work ended")
+		}
+		f.store.Close()
+		if size := f.cache.Size(); size != 0 {
+			t.Errorf("the cache holds %d bytes after the store was closed, the limit is 1", size)
+		}
+	})
+	t.Run("by the request that waited for the work", func(t *testing.T) {
+		// It holds the packs itself, to its own end.
+		f := newFixture(t, config{limit: 1})
+		r := ingested(t, archive(t, smallTree(1)))
+		f.pushContent(r)
+		hash := storeHash("one")
+		f.pushNarinfo(narinfoOf(t, hash, "one", r))
+		f.serves(r)
+		if _, err := f.store.Narinfo(background(t), hash); err != nil {
+			t.Fatalf("Narinfo: %v", err)
+		}
+		f.store.mu.Lock()
+		kept := len(f.store.kept)
+		f.store.mu.Unlock()
+		if kept != 0 || f.cache.Size() != 0 {
+			t.Errorf("%d references are kept and the cache holds %d bytes after the requests were served", kept, f.cache.Size())
+		}
+	})
+	t.Run("by the request that comes for a narinfo", func(t *testing.T) {
+		f := newFixture(t, config{limit: 1})
+		r := ingested(t, archive(t, smallTree(1)))
+		hash := storeHash("one")
+		info := narinfoOf(t, hash, "one", r)
+		f.pushNarinfo(info)
+		f.bucket.forget()
+		if ok, err := f.store.HasNarinfo(background(t), storeHash("nothing")); ok || err != nil {
+			t.Fatalf("HasNarinfo = %v, %v", ok, err)
+		}
+		f.srv.SlowBucket(300 * time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		_, err := f.store.Narinfo(ctx, hash)
+		notFound(t, "Narinfo with a wait of 50 ms", err)
+		eventually(t, "the work has ended", func() bool {
+			f.store.mu.Lock()
+			defer f.store.mu.Unlock()
+			return len(f.store.jobs) == 0
+		})
+		f.srv.SlowBucket(0)
+		if _, ok := f.cache.Meta(info.root); !ok {
+			t.Fatal("the narinfo's pack is not cached after the work ended")
+		}
+		if _, err := f.store.Narinfo(background(t), hash); err != nil {
+			t.Fatalf("Narinfo: %v", err)
+		}
+		if n := f.bucket.gets(".data", info.root); n != 1 {
+			t.Errorf("%d downloads of the narinfo's pack, want one", n)
+		}
+		if size := f.cache.Size(); size != 0 {
+			t.Errorf("the cache holds %d bytes after the narinfo was read, the limit is 1", size)
+		}
+	})
+}
+
+// The server names one pack, and what is cached under its root is a patch:
+// the work of another reference has placed it so in the moment since this
+// one saw a complete pack there. That is a failure for now.
+func TestPatchWithoutAParentNamed(t *testing.T) {
+	f := newFixture(t, config{})
+	v1, v2 := patched(t, 1, 4)
+	f.pushContent(v1)
+	f.pushContent(v2)
+	f.serves(v2)
+	if meta, ok := f.cache.Meta(v2.root); !ok || meta.Complete {
+		t.Fatalf("the pack of the second version is cached as %+v (%v), want a patch", meta, ok)
+	}
+
+	beside, err := f.store.parentOf([]client.Pack{{Root: v2.root}})
+	if err == nil || beside != nil {
+		t.Errorf("a patch for which no parent is named: parent %v, error %v, want an error", beside, err)
+	}
+	if errors.Is(err, errBroken) || errors.Is(err, errDamaged) || errors.Is(err, errGone) {
+		t.Errorf("the error %v is more than a failure for now", err)
+	}
+	other := ingested(t, archive(t, smallTree(3)))
+	if beside, err := f.store.parentOf([]client.Pack{{Root: v2.root}, {Root: other.root}}); err == nil || beside != nil {
+		t.Errorf("a patch for which another parent is named: parent %v, error %v, want an error", beside, err)
+	}
+
+	named := []client.Pack{{Root: v2.root}, {Root: v1.root}}
+	if beside, err := f.store.parentOf(named); err != nil || beside == nil || beside.Root != v1.root {
+		t.Errorf("a patch of the parent that is named: parent %v, error %v", beside, err)
+	}
+	if beside, err := f.store.parentOf([]client.Pack{{Root: v1.root}, {Root: other.root}}); err != nil || beside != nil {
+		t.Errorf("a complete pack: parent %v, error %v, want none", beside, err)
+	}
+	if _, err := f.store.parentOf([]client.Pack{{Root: other.root}}); !errors.Is(err, errGone) {
+		t.Errorf("a pack that is not cached: %v, want that it is gone", err)
+	}
+}
+
+// A sound patch and a broken one of the same parent, asked for at once
+// with nothing held back, round after round: the sound one is served every
+// time.
+func TestSoundReferenceBesideABrokenOne(t *testing.T) {
+	const rounds = 12
+	for round := range rounds {
+		f := newFixture(t, config{server: testserver.Options{NoVerify: true}})
+		v1, x := patched(t, 1, 4)
+		_, y := patched(t, 1, 5)
+		f.pushContent(v1)
+		f.pushContent(x)
+		broken := y.hash
+		if round%2 == 0 {
+			f.corruptPatch(y, v1)
+		} else {
+			broken, _ = f.withoutRecipe(v1, "the broken sibling")
+		}
+		if round%4 >= 2 {
+			// With the parent cached, the broken one's verdict waits for
+			// the parent to be fetched again.
+			f.serves(v1)
+		}
+
+		sound := f.asked(x.hash)
+		if round%3 == 1 {
+			eventually(t, "x has its own pack", func() bool { _, ok := f.cache.Meta(x.root); return ok })
+		}
+		_, err := f.store.Content(background(t), broken)
+		notFound(t, "Content of the broken sibling", err)
+		f.served(fmt.Sprintf("round %d: the sound reference", round), x, <-sound)
+		if f.log.has("level=ERROR", f.store.ContentName(x.hash)) {
+			t.Fatalf("round %d: the sound reference is in the log as broken", round)
+		}
+		if !f.log.has("level=ERROR", f.store.ContentName(broken)) {
+			t.Fatalf("round %d: the broken reference is not in the log as an error", round)
+		}
+		f.store.Close()
+	}
+}
+
+func TestDefaults(t *testing.T) {
+	s := New(context.Background(), nil, nil, Options{})
+	defer s.Close()
+	if s.keep != 15*time.Minute {
+		t.Errorf("a reference made local without a request is kept for %s, want 15 minutes", s.keep)
+	}
+	if n := cap(s.contentPlaces); n != 8 {
+		t.Errorf("%d content packs are downloaded at once, want 8", n)
+	}
+	if n := cap(s.narinfoPlaces); n != 16 {
+		t.Errorf("%d narinfo packs are downloaded at once, want 16", n)
+	}
+	if n := cap(s.checkPlaces); n != 8 {
+		t.Errorf("%d content references are checked at once, want 8", n)
+	}
+}
+
+// The text of a narinfo is its writer's, and so is the index it is read
+// through: readText stops at what a narinfo can be.
+func TestNarinfoTextIsReadWithinBounds(t *testing.T) {
+	blob := func(o *objects, data string) key.Key {
+		obj, err := fstree.EncodeBlob([]byte(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		o.emit(obj)
+		return obj.Key
+	}
+	// node stores a FileNode over children under a key that says length.
+	node := func(o *objects, length uint64, children ...key.Key) key.Key {
+		obj, err := fstree.EncodeFileNode(children)
+		if err != nil {
+			t.Fatal(err)
+		}
+		k, err := key.New(key.FileNode, length, obj.Bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		o.emit(fstree.Object{Key: k, Bytes: obj.Bytes})
+		return k
+	}
+
+	t.Run("an index that names nothing, again and again", func(t *testing.T) {
+		// Each level names the one below twice: four million reads for
+		// no byte of text.
+		o := newObjects()
+		k := blob(o, "")
+		for range 22 {
+			k = node(o, 0, k, k)
+		}
+		reads := 0
+		_, err := readText(k, func(k key.Key) ([]byte, error) {
+			reads++
+			return o.Get(k)
+		})
+		if !errors.Is(err, errBroken) {
+			t.Errorf("readText: %v, want a broken reference", err)
+		}
+		if reads > maxTextObjects+1 {
+			t.Errorf("%d objects were read, the limit is %d", reads, maxTextObjects)
+		}
+	})
+	for _, c := range []struct {
+		name   string
+		length uint64
+	}{
+		{"a key that says one byte more than the text has", 7},
+		{"a key that says one byte less than the text has", 5},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			o := newObjects()
+			text, err := readText(node(o, c.length, blob(o, "abc"), blob(o, "def")), o.Get)
+			if !errors.Is(err, errBroken) {
+				t.Errorf("readText gives %q and %v, want a broken reference", text, err)
+			}
+		})
+	}
+	o := newObjects()
+	if text, err := readText(node(o, 6, blob(o, "abc"), blob(o, "def")), o.Get); err != nil || string(text) != "abcdef" {
+		t.Errorf("readText of a text of its key's length gives %q and %v", text, err)
 	}
 }

@@ -18,14 +18,20 @@
 // reference. One download runs per pack, whichever references need it.
 //
 // A reference that cannot be what its name says is broken: it is refused,
-// the packs that were fetched for it are dropped from the cache, and it is
-// remembered, so that nothing is downloaded for it again while the name
-// points at the same root. That verdict is passed on packs as they came
-// from the server; packs that were cached and do not read as they should
-// are dropped and fetched again first. A transfer that fails is no broken
-// reference either, and is tried again by the next request. Whatever the
-// reason, a caller learns only that there is nothing to serve
-// (ErrNotFound); the log says why.
+// its own pack is dropped from the cache, and it is remembered, so that
+// nothing is downloaded for it again while the name points at the same
+// root. Its parent pack stays: it was checked object by object when it
+// came, and is the base of other references. That verdict is passed on
+// packs as they came from the server; packs that were cached and do not
+// read as they should are dropped and fetched again first, by the same
+// piece of work. A transfer that fails is no broken reference either, and
+// is tried again by the next request. Whatever the reason, a caller learns
+// only that there is nothing to serve (ErrNotFound); the log says why.
+//
+// The cache checks nothing when it is read. Every object this package
+// reads from it, to check a reference and to serve one, is held to its
+// key, so that bytes which changed on disk are not given out: the pack is
+// dropped and fetched again.
 package refs
 
 import (
@@ -35,6 +41,7 @@ import (
 	"log/slog"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/amber-store/core/key"
 	"github.com/amber-store/jaccard-store/client"
@@ -54,6 +61,10 @@ const (
 	// reference may announce. A narinfo is at most narinfo.MaxStored; the
 	// rest is room for a parent pack, should a server ever name one.
 	maxNarinfoPacks = 4 << 20
+
+	// defaultKeep is how long the packs of a reference stay held after
+	// the work that made it local, when no request comes to take it.
+	defaultKeep = 15 * time.Minute
 
 	// The lengths of the two hashes in Nix's base 32.
 	storeHashLen = 32
@@ -88,6 +99,9 @@ var (
 	// errDamaged marks a cached pack that could not be read as it was
 	// when it was placed. The reference is not at fault.
 	errDamaged = errors.New("the cached packs cannot be read")
+	// errGone marks a pack that left the cache under the work that needs
+	// it, dropped by the work of another reference.
+	errGone = errors.New("a pack left the cache while it was held")
 )
 
 // kind is which of the two references of a store path one is.
@@ -154,8 +168,20 @@ type Store struct {
 	// refused are the references found broken or of an unknown recipe,
 	// by name and then by root.
 	refused map[string]map[key.Key]refusal
+	// kept are the references that were made local and that no request
+	// has taken yet, with the holds on their packs. keep is for how long.
+	kept map[refKey]*kept
+	keep time.Duration
 	// work counts the jobs that run.
 	work sync.WaitGroup
+}
+
+// kept is the hold on the packs of a reference that no request has taken
+// since it was made local. It ends when a request takes the reference or
+// the timer fires, whichever is first.
+type kept struct {
+	hold  *packcache.Hold
+	timer *time.Timer
 }
 
 // New returns a store whose downloads and checks run under ctx, not
@@ -169,6 +195,8 @@ func New(ctx context.Context, cache *packcache.Cache, rem *remote.Remote, opts O
 		jobs:    make(map[refKey]*job),
 		fetches: make(map[key.Key]*flight),
 		refused: make(map[string]map[key.Key]refusal),
+		kept:    make(map[refKey]*kept),
+		keep:    defaultKeep,
 	}
 	s.ctx, s.cancel = context.WithCancel(ctx)
 	if s.log == nil {
@@ -198,6 +226,60 @@ func (s *Store) Close() {
 	s.mu.Unlock()
 	s.cancel()
 	s.work.Wait()
+
+	// No job is left to keep anything.
+	s.mu.Lock()
+	left := s.kept
+	s.kept = make(map[refKey]*kept)
+	s.mu.Unlock()
+	for _, entry := range left {
+		entry.timer.Stop()
+		entry.hold.Release()
+	}
+}
+
+// keepLocked keeps hold, the hold of the job that made the reference of k
+// local, until a request has taken the reference. The requests that wait
+// for the job do so at once. But the request that began it may have given
+// up, and then, without this, the packs of a reference that does not fit
+// the cache's limit, alone or beside what other requests hold, are evicted
+// the moment the job ends: the request that comes again finds nothing and
+// begins the same download (spec 6.4 promises it finds the work done). The
+// hold ends with that request, or after s.keep, so that the cache does
+// return to its limit.
+//
+// It returns the hold the caller is to release once it has let go of
+// s.mu, which it has now: nil, the one that was kept for k before, or
+// hold itself when the store is closed and keeps nothing.
+func (s *Store) keepLocked(k refKey, hold *packcache.Hold) *packcache.Hold {
+	if s.closed {
+		return hold
+	}
+	entry := &kept{hold: hold}
+	entry.timer = time.AfterFunc(s.keep, func() { s.letGo(k, entry) })
+	old := s.kept[k]
+	s.kept[k] = entry
+	if old == nil {
+		return nil
+	}
+	old.timer.Stop()
+	return old.hold
+}
+
+// letGo ends the hold that is kept for the reference of k: the one of
+// entry when the time of that is over, whichever there is when a request
+// has taken the reference (entry nil).
+func (s *Store) letGo(k refKey, entry *kept) {
+	s.mu.Lock()
+	have := s.kept[k]
+	if have == nil || (entry != nil && have != entry) {
+		s.mu.Unlock()
+		return
+	}
+	delete(s.kept, k)
+	s.mu.Unlock()
+	have.timer.Stop()
+	have.hold.Release()
 }
 
 // NarinfoName returns the name of the narinfo reference of the store path
@@ -347,6 +429,13 @@ func admit(k kind, root key.Key, packs []client.Pack) error {
 				return brokenf("the packs of the root %s announce more than %d bytes of objects", root, maxNarinfoPacks)
 			}
 			announced += p.Bytes
+			// The bytes bound the data and not the index, which is read
+			// whole into memory before any object is looked at: objects
+			// may be empty, and sixteen million of them announce next to
+			// nothing. A narinfo is read from maxTextObjects at most.
+			if p.Objects > maxTextObjects {
+				return brokenf("the pack of %s announces %d objects, the packs of a narinfo have at most %d each", p.Root, p.Objects, maxTextObjects)
+			}
 		}
 	case kindContent:
 		if t := root.Type(); t != key.DirLeaf && t != key.DirNode {
@@ -401,28 +490,23 @@ func (r ref) again(why refusal) error {
 // settle is the end of every attempt to make r local. It turns err, the
 // outcome, into what the callers get, and acts on it:
 //
-//   - A broken reference is remembered, and packs, those that were made
-//     local for it, are dropped from the cache.
+//   - A broken reference is remembered, and drop, its own pack if that was
+//     fetched for it, is dropped from the cache. The parent stays: it is
+//     sound, and other references read it.
 //   - A recipe of another format or version is remembered; the packs stay.
-//   - Cached packs that cannot be read are dropped, to be fetched again.
-//   - Anything else is a failure for now, and only logged.
-func (s *Store) settle(r ref, packs []client.Pack, err error) error {
+//   - Anything else is a failure for now, and only logged. Cached packs
+//     that could not be read were dropped by the work itself.
+func (s *Store) settle(r ref, drop []key.Key, err error) error {
 	switch {
 	case err == nil:
 		return nil
 	case errors.Is(err, errBroken):
 		s.refuse(r, true, err)
-		for _, p := range packs {
-			s.cache.Drop(p.Root)
+		for _, root := range drop {
+			s.cache.Drop(root)
 		}
 	case errors.Is(err, nartree.ErrUnknownRecipe):
 		s.refuse(r, false, err)
-	case errors.Is(err, errDamaged):
-		s.log.Warn("cached packs cannot be read and are dropped from the cache",
-			"name", r.name, "root", r.root.String(), "error", err.Error())
-		for _, p := range packs {
-			s.cache.Drop(p.Root)
-		}
 	case s.ctx.Err() != nil:
 		s.log.Debug("making a reference local was given up", "name", r.name, "root", r.root.String(), "error", err.Error())
 	default:
@@ -449,26 +533,35 @@ func (s *Store) obtain(ctx context.Context, r ref, packs []client.Pack) (*packca
 	reserved := s.cache.Reserve(roots(packs)...)
 	defer reserved.Release()
 
-	if !s.isLocal(r, packs) {
-		j, err := s.join(r, packs)
-		if err != nil {
-			return nil, err
-		}
-		select {
-		case <-j.done:
-			if j.err != nil {
-				return nil, j.err
+	// A reservation keeps a pack from eviction and not from being dropped:
+	// the work of another reference drops a pack it shares with this one
+	// when it finds that it cannot trust it (see make). A request that
+	// comes out of the work and finds a pack gone has the work done again,
+	// which fetches the pack and rebuilds nothing twice.
+	for round := 1; ; round++ {
+		if !s.isLocal(r, packs) {
+			j, err := s.join(r, packs)
+			if err != nil {
+				return nil, err
 			}
-		case <-ctx.Done():
-			// The work goes on: the next request finds it done.
-			return nil, gaveUp(ctx, r.name)
+			select {
+			case <-j.done:
+				if j.err != nil {
+					return nil, j.err
+				}
+			case <-ctx.Done():
+				// The work goes on: the next request finds it done.
+				return nil, gaveUp(ctx, r.name)
+			}
+		}
+		if hold, ok := s.cache.Acquire(r.root); ok {
+			s.letGo(r.key(), nil)
+			return hold, nil
+		}
+		if round == maxRounds {
+			return nil, notFoundf("the packs of %s left the cache, again and again", r.name)
 		}
 	}
-	hold, ok := s.cache.Acquire(r.root)
-	if !ok {
-		return nil, notFoundf("the packs of %s left the cache", r.name)
-	}
-	return hold, nil
 }
 
 // fromRecord returns a hold on the packs the record of name asks for,
@@ -483,6 +576,7 @@ func (s *Store) fromRecord(name string, checked bool) (root key.Key, hold *packc
 	if !ok {
 		return key.Key{}, nil, false
 	}
+	s.letGo(refKey{name: name, root: rec.Root}, nil)
 	return rec.Root, hold, true
 }
 

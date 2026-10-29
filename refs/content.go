@@ -72,7 +72,7 @@ func (s *Store) Content(ctx context.Context, narHash string) (*Content, error) {
 // open reads the recipe of r through hold and returns the content, which
 // takes the hold over. The recipe must be of the NAR r is named for.
 func (s *Store) open(r ref, sum [32]byte, hold *packcache.Hold) (*Content, error) {
-	opened, err := nartree.Open(r.root, hold.Get)
+	opened, err := nartree.Open(r.root, sound(hold.Get))
 	if err != nil {
 		return nil, err
 	}
@@ -87,9 +87,16 @@ func (s *Store) open(r ref, sum [32]byte, hold *packcache.Hold) (*Content, error
 // the reference is named for, and the NAR rebuilt from the tree must have
 // the hash and length the recipe states. The rebuilding is done once per
 // root: a reference that is recorded as checked, and is here again
-// because a pack of it had left the cache, is not rebuilt.
-func (s *Store) checkContent(r ref, hold *packcache.Hold) error {
-	opened, err := nartree.Open(r.root, hold.Get)
+// because a pack of it had left the cache, is not rebuilt, nor is one
+// that this work has rebuilt before.
+//
+// A recipe that states more than nartree.MaxNARSize bytes is broken
+// without a rebuild. With that, and with the rebuild ending at the first
+// byte beyond what the recipe states, the check of any reference, however
+// it was built, costs no more than the hashing of an archive of that
+// length.
+func (s *Store) checkContent(r ref, hold *packcache.Hold, got *progress) error {
+	opened, err := nartree.Open(r.root, sound(hold.Get))
 	switch {
 	case errors.Is(err, nartree.ErrUnknownRecipe):
 		return err
@@ -101,10 +108,17 @@ func (s *Store) checkContent(r ref, hold *packcache.Hold) error {
 	if sum, _ := narSum(r.hash); opened.NarHash != sum {
 		return brokenf("its recipe is of the NAR %s, not of %s", nix32.Encode(opened.NarHash[:]), r.hash)
 	}
-	if rec, ok := s.cache.Record(r.name); ok && rec.Root == r.root && rec.Checked {
+	if opened.NarSize > nartree.MaxNARSize {
+		return brokenf("its recipe states a NAR of %d bytes, and none of more than %d is taken", opened.NarSize, uint64(nartree.MaxNARSize))
+	}
+	if rec, ok := s.cache.Record(r.name); got.rebuilt || (ok && rec.Root == r.root && rec.Checked) {
 		return nil
 	}
-	return s.rebuild(r, opened, hold)
+	if err := s.rebuild(r, opened, hold); err != nil {
+		return err
+	}
+	got.rebuilt = true
+	return nil
 }
 
 // rebuild writes the NAR of opened into a hash and compares what comes
@@ -115,7 +129,7 @@ func (s *Store) rebuild(r ref, opened nartree.Content, hold *packcache.Hold) err
 	started := time.Now()
 	sum := sha256.New()
 	out := &measured{w: &guarded{ctx: s.ctx, w: sum}, limit: opened.NarSize}
-	err := nartree.WriteNAR(out, opened.Node, hold.Get)
+	err := nartree.WriteNAR(out, opened.Node, sound(hold.Get))
 	switch {
 	case errors.Is(out.err, errTooLong):
 		return brokenf("its NAR is longer than the %d bytes its recipe states", opened.NarSize)
@@ -158,6 +172,9 @@ func (c *Content) NarSize() uint64 { return c.narSize }
 // the cache or of narrenhaus, since the reference was checked: it is
 // logged as one, the reference's pack is dropped from the cache, and w
 // has received a beginning of the NAR and never a byte beyond NarSize.
+// Every object is held to its key before its bytes go out, so a pack
+// whose bytes changed on disk is such a defect, found at the object that
+// changed: what w has by then is right, and is not the whole NAR.
 // WriteTo does not buffer: w gets one Write per node and per chunk of a
 // file.
 func (c *Content) WriteTo(w io.Writer) (int64, error) {
@@ -165,7 +182,7 @@ func (c *Content) WriteTo(w io.Writer) (int64, error) {
 		return 0, fmt.Errorf("refs: %s is written after its release", c.ref.name)
 	}
 	out := &measured{w: w, limit: c.narSize}
-	err := nartree.WriteNAR(out, c.node, c.hold.Get)
+	err := nartree.WriteNAR(out, c.node, sound(c.hold.Get))
 	switch {
 	case out.err != nil && !errors.Is(out.err, errTooLong):
 		return int64(out.n), out.err

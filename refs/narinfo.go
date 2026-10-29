@@ -50,7 +50,7 @@ func (s *Store) Narinfo(ctx context.Context, storeHash string) (*narinfo.Info, e
 		return nil, err
 	}
 	defer hold.Release()
-	info, err := readNarinfo(r, hold.Get)
+	info, err := readNarinfo(r, sound(hold.Get))
 	if err != nil {
 		return nil, s.unreadable(r, err)
 	}
@@ -68,7 +68,7 @@ func (s *Store) narinfoOffline(name, storeHash string, cause error) (*narinfo.In
 	}
 	defer hold.Release()
 	r := ref{kind: kindNarinfo, name: name, hash: storeHash, root: root}
-	info, err := readNarinfo(r, hold.Get)
+	info, err := readNarinfo(r, sound(hold.Get))
 	if err != nil {
 		return nil, s.unreadable(r, err)
 	}
