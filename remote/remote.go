@@ -17,7 +17,10 @@
 // A lookup waits for its answer as long as its limit lasts, with one
 // exception: on a connection that was up before it, which may have died
 // unseen, it waits a short time only and is then repeated on a fresh one
-// (see Lookup).
+// (see Lookup). That short time, RepeatAfter, is also the least a lookup
+// must have waited on a connection to retire it for its silence: one that
+// spent its limit waiting for the dial says nothing about the connection
+// the dial made.
 //
 // Dials are serialised. Every call that needs a connection while one is
 // being dialled waits for that dial and shares its outcome. A dial runs
@@ -69,9 +72,10 @@ type Config struct {
 	// round trip together; 0 means 10 s.
 	LookupTimeout time.Duration
 	// RepeatAfter is how long a lookup waits for its answer on a connection
-	// that was up before it; then it is repeated on a fresh one. 0 means
-	// 3 s, or three tenths of LookupTimeout where that is less. It is
-	// never more than half of LookupTimeout.
+	// that was up before it; then it is repeated on a fresh one. It is
+	// also the least a lookup must have waited on a connection for its
+	// silence to retire it. 0 means 3 s, or three tenths of LookupTimeout
+	// where that is less. It is never more than half of LookupTimeout.
 	RepeatAfter time.Duration
 	// DialTimeout bounds a dial; 0 means 30 s.
 	DialTimeout time.Duration
@@ -266,6 +270,7 @@ func (r *Remote) Lookup(ctx context.Context, name string) (key.Key, []client.Pac
 		if first {
 			attempt, stop = r.firstAttempt(limited, c.link)
 		}
+		began := time.Now()
 		root, packs, err := client.New(c, r.http).Lookup(attempt, name)
 		cut := attempt.Err() != nil && limited.Err() == nil
 		stop()
@@ -283,8 +288,12 @@ func (r *Remote) Lookup(ctx context.Context, name string) (key.Key, []client.Pac
 			silence = fmt.Errorf("no answer to a lookup within %s", r.repeatAfter)
 			c.lost.Store(true)
 		case limited.Err() != nil && ctx.Err() == nil:
-			silence = fmt.Errorf("no answer to a lookup within %s", r.lookupTimeout)
-			c.lost.Store(true)
+			// The limit ran out. A lookup that spent it waiting for the
+			// dial has had the connection too briefly to judge it.
+			if waited := time.Since(began); waited >= r.repeatAfter {
+				silence = fmt.Errorf("no answer to a lookup within %s", waited.Round(time.Millisecond))
+				c.lost.Store(true)
+			}
 		}
 		lost := r.end(c, errors.Join(silence, err))
 		switch {

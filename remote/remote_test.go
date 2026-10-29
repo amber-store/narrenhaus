@@ -840,6 +840,44 @@ func TestLookupOnASilentConnection(t *testing.T) {
 		}
 		eventually(t, "the second silent connection is closed", d.conn(t, 1).closed.Load)
 	})
+
+	t.Run("that came late is not retired", func(t *testing.T) {
+		const (
+			lookupTimeout = time.Second
+			repeatAfter   = 500 * time.Millisecond
+		)
+		srv := testserver.Start(t, testserver.Options{})
+		d := &dialer{dial: srv.Dial(), delay: 700 * time.Millisecond}
+		d.mute.Store(true)
+		r := newRemote(t, remote.Config{Dial: d.Dial, LookupTimeout: lookupTimeout, RepeatAfter: repeatAfter})
+		ctx := context.Background()
+
+		// The lookup waits most of its time for the dial. What is left is
+		// too short to judge the connection by.
+		started := time.Now()
+		_, _, err := r.Lookup(ctx, "acme/absent")
+		took := time.Since(started)
+		if !errors.Is(err, remote.ErrUnreachable) {
+			t.Fatalf("Lookup without an answer: %v, want ErrUnreachable", err)
+		}
+		if took < lookupTimeout || took > lookupTimeout+250*time.Millisecond {
+			t.Fatalf("Lookup without an answer took %v, the limit is %v", took, lookupTimeout)
+		}
+		first := d.conn(t, 0)
+		first.silent(t, 0)
+
+		d.mute.Store(false)
+		first.mute.Store(false)
+		if _, _, err := r.Lookup(ctx, "acme/absent"); !errors.Is(err, client.ErrNotFound) {
+			t.Fatalf("Lookup after the one that timed out: %v, want client.ErrNotFound", err)
+		}
+		if n := d.calls.Load(); n != 1 {
+			t.Fatalf("%d dials, want 1: the lookup that timed out had the connection for under %v", n, repeatAfter)
+		}
+		if first.closed.Load() {
+			t.Fatal("the connection that came late was closed")
+		}
+	})
 }
 
 func TestBucketFailureDoesNotRetire(t *testing.T) {
