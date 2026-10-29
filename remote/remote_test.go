@@ -56,6 +56,8 @@ type dialer struct {
 	dial  func(ctx context.Context) (remote.Conn, error)
 	delay time.Duration
 	calls atomic.Int32
+	// mute: the connections dialled while it is set are mute from the first.
+	mute atomic.Bool
 
 	mu    sync.Mutex
 	conns []*conn
@@ -75,6 +77,7 @@ func (d *dialer) Dial(ctx context.Context) (remote.Conn, error) {
 		return nil, err
 	}
 	w := &conn{Conn: c}
+	w.mute.Store(d.mute.Load())
 	d.mu.Lock()
 	d.conns = append(d.conns, w)
 	d.mu.Unlock()
@@ -538,9 +541,9 @@ func TestRefusalDoesNotRetire(t *testing.T) {
 }
 
 func TestRetiredConnectionOutlivesItsCalls(t *testing.T) {
-	const lookupTimeout = 200 * time.Millisecond
+	const repeatAfter = 200 * time.Millisecond
 	srv := testserver.Start(t, testserver.Options{})
-	r, d := watched(t, srv, remote.Config{LookupTimeout: lookupTimeout})
+	r, d := watched(t, srv, remote.Config{LookupTimeout: 5 * time.Second, RepeatAfter: repeatAfter})
 	ctx := context.Background()
 	if err := r.Reachable(ctx); err != nil {
 		t.Fatalf("Reachable: %v", err)
@@ -548,7 +551,7 @@ func TestRetiredConnectionOutlivesItsCalls(t *testing.T) {
 	first := d.conn(t, 0)
 
 	// A push in flight: it has asked the server where to upload and is
-	// held up in the bucket for longer than a lookup may take.
+	// held up in the bucket for longer than a lookup waits for its answer.
 	puts := arrivals(srv, http.MethodPut)
 	srv.SlowBucket(time.Second)
 	root, objs := blob(t, "slow")
@@ -559,17 +562,18 @@ func TestRetiredConnectionOutlivesItsCalls(t *testing.T) {
 	}()
 	waitFor(t, "the push reaches the bucket", puts)
 
-	// A lookup on the same connection that gets no answer.
+	// A lookup on the same connection that gets no answer: it has its
+	// answer from a fresh one.
 	first.mute.Store(true)
 	started := time.Now()
 	_, _, err := r.Lookup(ctx, "acme/slow")
 	took := time.Since(started)
 	first.mute.Store(false)
-	if !errors.Is(err, remote.ErrUnreachable) {
-		t.Fatalf("Lookup without an answer: %v, want ErrUnreachable", err)
+	if !errors.Is(err, client.ErrNotFound) {
+		t.Fatalf("Lookup without an answer on the first connection: %v, want client.ErrNotFound from a fresh one", err)
 	}
-	if took < lookupTimeout || took > lookupTimeout+250*time.Millisecond {
-		t.Fatalf("Lookup without an answer took %v, the limit is %v", took, lookupTimeout)
+	if took < repeatAfter || took > repeatAfter+500*time.Millisecond {
+		t.Fatalf("Lookup without an answer on the first connection took %v, it is repeated after %v", took, repeatAfter)
 	}
 
 	// The connection is retired, and it is not closed under the push.
@@ -578,11 +582,11 @@ func TestRetiredConnectionOutlivesItsCalls(t *testing.T) {
 	}
 	select {
 	case err := <-pushed:
-		t.Fatalf("the push ended before the lookup timed out: %v", err)
+		t.Fatalf("the push ended before the lookup did: %v", err)
 	default:
 	}
 	if err := r.Reachable(ctx); err != nil {
-		t.Fatalf("Reachable after the lookup timed out: %v", err)
+		t.Fatalf("Reachable after the lookup: %v", err)
 	}
 	if n := d.calls.Load(); n != 2 {
 		t.Fatalf("%d dials, want 2: the retired connection takes no new call", n)
@@ -663,20 +667,21 @@ func TestOnlyTheFirstFailureRetires(t *testing.T) {
 		}
 	})
 
-	t.Run("lookups that time out together", func(t *testing.T) {
+	t.Run("lookups that get no answer together", func(t *testing.T) {
 		srv := testserver.Start(t, testserver.Options{})
-		r, d := watched(t, srv, remote.Config{LookupTimeout: 300 * time.Millisecond})
+		r, d := watched(t, srv, remote.Config{LookupTimeout: 5 * time.Second, RepeatAfter: 300 * time.Millisecond})
 		ctx := context.Background()
 		if err := r.Reachable(ctx); err != nil {
 			t.Fatalf("Reachable: %v", err)
 		}
 
+		// All of them are repeated, and on one fresh connection.
 		d.conn(t, 0).mute.Store(true)
 		var wg sync.WaitGroup
 		for range 8 {
 			wg.Go(func() {
-				if _, _, err := r.Lookup(ctx, "acme/absent"); !errors.Is(err, remote.ErrUnreachable) {
-					t.Errorf("Lookup without an answer: %v, want ErrUnreachable", err)
+				if _, _, err := r.Lookup(ctx, "acme/absent"); !errors.Is(err, client.ErrNotFound) {
+					t.Errorf("Lookup without an answer on the first connection: %v, want client.ErrNotFound from a fresh one", err)
 				}
 			})
 		}
@@ -690,6 +695,150 @@ func TestOnlyTheFirstFailureRetires(t *testing.T) {
 			t.Fatalf("%d dials, want 2", n)
 		}
 		eventually(t, "the retired connection is closed", d.conn(t, 0).closed.Load)
+	})
+}
+
+func TestLookupAfterTheServerForgot(t *testing.T) {
+	const repeatAfter = 500 * time.Millisecond
+	srv := testserver.Start(t, testserver.Options{})
+	// The limit of a lookup is the one the command runs with.
+	r, d := watched(t, srv, remote.Config{RepeatAfter: repeatAfter})
+	ctx := context.Background()
+	want := push(t, r, "acme/one", "one")
+	if _, _, err := r.Lookup(ctx, "acme/one"); err != nil {
+		t.Fatalf("Lookup before the server forgot: %v", err)
+	}
+
+	// What a sleep of the machine leaves behind: the server has given the
+	// connection up and the client has not heard of it.
+	srv.Forget()
+
+	started := time.Now()
+	root, _, err := r.Lookup(ctx, "acme/one")
+	took := time.Since(started)
+	if err != nil {
+		t.Fatalf("Lookup after the server forgot the connection: %v (after %v)", err, took)
+	}
+	if root != want {
+		t.Fatalf("Lookup after the server forgot the connection: root %s, want %s", root, want)
+	}
+	if took < repeatAfter {
+		t.Fatalf("Lookup took %v: the connection was not silent for %v, so this shows nothing", took, repeatAfter)
+	}
+	if took > repeatAfter+2*time.Second {
+		t.Fatalf("Lookup took %v, want an answer soon after %v", took, repeatAfter)
+	}
+	if n := d.calls.Load(); n != 2 {
+		t.Fatalf("%d dials, want 2: one redial", n)
+	}
+	eventually(t, "the forgotten connection is closed", d.conn(t, 0).closed.Load)
+}
+
+func TestLookupOnASilentConnection(t *testing.T) {
+	t.Run("that was up is repeated on a fresh one", func(t *testing.T) {
+		const repeatAfter = 300 * time.Millisecond
+		srv := testserver.Start(t, testserver.Options{})
+		r, d := watched(t, srv, remote.Config{LookupTimeout: 5 * time.Second, RepeatAfter: repeatAfter})
+		ctx := context.Background()
+		want := push(t, r, "acme/one", "one")
+
+		d.conn(t, 0).mute.Store(true)
+		started := time.Now()
+		root, _, err := r.Lookup(ctx, "acme/one")
+		took := time.Since(started)
+		if err != nil || root != want {
+			t.Fatalf("Lookup on a connection that went silent: root %s, %v; want %s", root, err, want)
+		}
+		if took < repeatAfter || took > repeatAfter+500*time.Millisecond {
+			t.Fatalf("Lookup took %v, it is repeated after %v", took, repeatAfter)
+		}
+		if n := d.calls.Load(); n != 2 {
+			t.Fatalf("%d dials, want 2: one redial", n)
+		}
+		eventually(t, "the silent connection is closed", d.conn(t, 0).closed.Load)
+	})
+
+	t.Run("lookups that wait on it are released by the first", func(t *testing.T) {
+		const repeatAfter = time.Second
+		srv := testserver.Start(t, testserver.Options{})
+		r, d := watched(t, srv, remote.Config{LookupTimeout: 5 * time.Second, RepeatAfter: repeatAfter})
+		ctx := context.Background()
+		want := push(t, r, "acme/one", "one")
+		first := d.conn(t, 0)
+
+		first.mute.Store(true)
+		type result struct {
+			root key.Key
+			err  error
+			took time.Duration
+		}
+		lookup := func(done chan<- result) {
+			started := time.Now()
+			root, _, err := r.Lookup(ctx, "acme/one")
+			done <- result{root, err, time.Since(started)}
+		}
+		early, late := make(chan result, 1), make(chan result, 1)
+		go lookup(early)
+		first.silent(t, 0)
+		// The second comes when the first has waited half its time.
+		time.Sleep(repeatAfter / 2)
+		go lookup(late)
+
+		for _, c := range []struct {
+			name string
+			done chan result
+		}{{"first", early}, {"second", late}} {
+			got := waitFor(t, "the "+c.name+" lookup ends", c.done)
+			if got.err != nil || got.root != want {
+				t.Fatalf("the %s lookup: root %s, %v; want %s", c.name, got.root, got.err, want)
+			}
+			if c.done == late && got.took >= repeatAfter {
+				t.Fatalf("the second lookup took %v: it waited its own %v on a connection the first had retired", got.took, repeatAfter)
+			}
+		}
+		if n := d.calls.Load(); n != 2 {
+			t.Fatalf("%d dials, want 2: one redial for both", n)
+		}
+	})
+
+	t.Run("and a fresh one that is silent too", func(t *testing.T) {
+		const (
+			lookupTimeout = 800 * time.Millisecond
+			repeatAfter   = 200 * time.Millisecond
+		)
+		srv := testserver.Start(t, testserver.Options{})
+		r, d := watched(t, srv, remote.Config{LookupTimeout: lookupTimeout, RepeatAfter: repeatAfter})
+		ctx := context.Background()
+		if err := r.Reachable(ctx); err != nil {
+			t.Fatalf("Reachable: %v", err)
+		}
+
+		d.conn(t, 0).mute.Store(true)
+		d.mute.Store(true)
+		started := time.Now()
+		_, _, err := r.Lookup(ctx, "acme/absent")
+		took := time.Since(started)
+		if !errors.Is(err, remote.ErrUnreachable) {
+			t.Fatalf("Lookup without an answer: %v, want ErrUnreachable", err)
+		}
+		if took < lookupTimeout || took > lookupTimeout+250*time.Millisecond {
+			t.Fatalf("Lookup without an answer took %v, the limit is %v", took, lookupTimeout)
+		}
+		// Repeated once and no more.
+		if n := d.calls.Load(); n != 2 {
+			t.Fatalf("%d dials, want 2", n)
+		}
+
+		// The second connection had the rest of the limit to answer in and
+		// is retired as the first was.
+		d.mute.Store(false)
+		if _, _, err := r.Lookup(ctx, "acme/absent"); !errors.Is(err, client.ErrNotFound) {
+			t.Fatalf("Lookup after two silent connections: %v, want client.ErrNotFound", err)
+		}
+		if n := d.calls.Load(); n != 3 {
+			t.Fatalf("%d dials, want 3", n)
+		}
+		eventually(t, "the second silent connection is closed", d.conn(t, 1).closed.Load)
 	})
 }
 
@@ -1092,6 +1241,34 @@ func TestClose(t *testing.T) {
 	if n := d.calls.Load(); n != 1 {
 		t.Fatalf("%d dials, want 1: nothing is dialled after Close", n)
 	}
+
+	t.Run("releases a lookup that waits", func(t *testing.T) {
+		r, d := watched(t, srv, remote.Config{})
+		if err := r.Reachable(ctx); err != nil {
+			t.Fatalf("Reachable: %v", err)
+		}
+		first := d.conn(t, 0)
+		first.mute.Store(true)
+		failed := make(chan error, 1)
+		go func() {
+			_, _, err := r.Lookup(ctx, "acme/one")
+			failed <- err
+		}()
+		first.silent(t, 0)
+
+		started := time.Now()
+		r.Close()
+		if err := waitFor(t, "the lookup ends", failed); !errors.Is(err, remote.ErrUnreachable) {
+			t.Fatalf("a lookup that waited when the Remote was closed: %v, want ErrUnreachable", err)
+		}
+		if took := time.Since(started); took > time.Second {
+			t.Fatalf("the lookup ended %v after Close", took)
+		}
+		eventually(t, "the connection is closed", first.closed.Load)
+		if n := d.calls.Load(); n != 1 {
+			t.Fatalf("%d dials, want 1: nothing is dialled after Close", n)
+		}
+	})
 }
 
 func TestStalledTransferFails(t *testing.T) {

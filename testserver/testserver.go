@@ -4,9 +4,10 @@
 // loopback. It is a package and no test file so that the tests of several
 // packages can import it.
 //
-// The server can be stopped and restarted and its connections dropped, and
-// the bucket can be made slow or be answered for, so that a test can show
-// what its package does when the server or the bucket lets it down.
+// The server can be stopped and restarted and its connections dropped or
+// forgotten, and the bucket can be made slow or be answered for, so that a
+// test can show what its package does when the server or the bucket lets
+// it down.
 //
 // The bucket (jaccard-store's buckettest) sets the environment of the test
 // with t.Setenv, so a test that calls Start cannot be parallel.
@@ -215,6 +216,29 @@ func (s *Server) DropConnections() {
 	if run != nil {
 		run.drop()
 	}
+}
+
+// Forget makes the server lose every client connection without a word to
+// its client, as a server does whose idle timeout ran out while the client
+// slept: the endpoint goes away with its connections as they are, and a new
+// one answers at the same address. A client's side of such a connection
+// still takes streams and writes, and nothing comes back on it until the
+// client's transport gives it up. Forget on a stopped server does nothing.
+func (s *Server) Forget() {
+	s.t.Helper()
+	s.mu.Lock()
+	run := s.run
+	s.run = nil
+	s.mu.Unlock()
+	if run == nil {
+		return
+	}
+	// The socket goes first: when the serving ends and closes its
+	// connections, there is nothing left to say so through.
+	run.ep.Shutdown(context.Background())
+	run.stop()
+	<-run.done
+	s.start()
 }
 
 // SlowBucket makes every bucket transfer wait d before its first byte;

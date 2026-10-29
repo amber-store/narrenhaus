@@ -5,14 +5,19 @@
 //
 // A connection is retired when it has shown itself broken: a stream could
 // not be opened on it, a frame could not be written or read, or a lookup
-// got no answer within its limit. What the server answers never retires
-// it, whether a name it does not know or a request it refuses, and neither
-// does anything that happens between a call and the bucket. A retired
-// connection takes no new call; it is closed when the last call that runs
-// on it has returned, so a push in flight is not cut by the failure of
-// another request. Of the calls that fail on one connection the first
-// retires it and the others find it retired: none of them touches the
-// connection that was dialled since.
+// got no answer in the time it waits for one. What the server answers
+// never retires it, whether a name it does not know or a request it
+// refuses, and neither does anything that happens between a call and the
+// bucket. A retired connection takes no new call; it is closed when the
+// last call that runs on it has returned, so a push in flight is not cut
+// by the failure of another request. Of the calls that fail on one
+// connection the first retires it and the others find it retired: none of
+// them touches the connection that was dialled since.
+//
+// A lookup waits for its answer as long as its limit lasts, with one
+// exception: on a connection that was up before it, which may have died
+// unseen, it waits a short time only and is then repeated on a fresh one
+// (see Lookup).
 //
 // Dials are serialised. Every call that needs a connection while one is
 // being dialled waits for that dial and shares its outcome. A dial runs
@@ -41,6 +46,7 @@ import (
 
 const (
 	defaultLookupTimeout = 10 * time.Second
+	defaultRepeatAfter   = 3 * time.Second
 	defaultDialTimeout   = 30 * time.Second
 	defaultFailFast      = 30 * time.Second
 )
@@ -62,6 +68,11 @@ type Config struct {
 	// LookupTimeout bounds a lookup, the wait for a connection and the
 	// round trip together; 0 means 10 s.
 	LookupTimeout time.Duration
+	// RepeatAfter is how long a lookup waits for its answer on a connection
+	// that was up before it; then it is repeated on a fresh one. 0 means
+	// 3 s, or three tenths of LookupTimeout where that is less. It is
+	// never more than half of LookupTimeout.
+	RepeatAfter time.Duration
 	// DialTimeout bounds a dial; 0 means 30 s.
 	DialTimeout time.Duration
 	// FailFast is how long after a failed dial calls fail without
@@ -84,6 +95,7 @@ type Remote struct {
 	dial          func(ctx context.Context) (Conn, error)
 	http          *http.Client
 	lookupTimeout time.Duration
+	repeatAfter   time.Duration
 	dialTimeout   time.Duration
 	failFast      time.Duration
 	log           *slog.Logger
@@ -114,6 +126,8 @@ type link struct {
 	// calls and retired are guarded by Remote.mu.
 	calls   int
 	retired bool
+	// gone is closed when the link is retired.
+	gone chan struct{}
 }
 
 // dialling is one dial and its outcome, which is set before done is closed.
@@ -129,6 +143,7 @@ func New(cfg Config) *Remote {
 		dial:          cfg.Dial,
 		http:          cfg.HTTP,
 		lookupTimeout: cfg.LookupTimeout,
+		repeatAfter:   cfg.RepeatAfter,
 		dialTimeout:   cfg.DialTimeout,
 		failFast:      cfg.FailFast,
 		log:           cfg.Log,
@@ -142,6 +157,10 @@ func New(cfg Config) *Remote {
 	if r.lookupTimeout <= 0 {
 		r.lookupTimeout = defaultLookupTimeout
 	}
+	if r.repeatAfter <= 0 {
+		r.repeatAfter = min(defaultRepeatAfter, r.lookupTimeout*3/10)
+	}
+	r.repeatAfter = min(r.repeatAfter, r.lookupTimeout/2)
 	if r.dialTimeout <= 0 {
 		r.dialTimeout = defaultDialTimeout
 	}
@@ -174,10 +193,9 @@ func (r *Remote) Close() {
 	}
 	r.closed = true
 	l := r.current
-	r.current = nil
 	idle := false
 	if l != nil {
-		l.retired = true
+		r.retire(l)
 		idle = l.calls == 0
 	}
 	r.mu.Unlock()
@@ -220,9 +238,17 @@ func (r *Remote) Reachable(ctx context.Context) error {
 }
 
 // Lookup is client.Lookup within LookupTimeout. client.ErrNotFound for an
-// unknown name; ErrUnreachable when the server could not be asked. A
-// lookup that fails on a connection that was up is repeated once on a
-// fresh one within the same limit.
+// unknown name; ErrUnreachable when the server could not be asked.
+//
+// A connection that was up before the lookup may have died since it was
+// last used, as it does while the machine sleeps, and it need not show:
+// it takes streams and frames, and nothing comes back. So on such a
+// connection the lookup waits RepeatAfter for its answer and no longer.
+// Without one it retires the connection and is repeated once, on a fresh
+// one and in what is left of LookupTimeout. A lookup is repeated likewise
+// when such a connection fails it, or is retired by another call while the
+// lookup waits. A connection dialled for the lookup has the rest of the
+// limit to answer in, and so has the one the lookup is repeated on.
 //
 // A refusal of the server is returned as the *wire.Error it sent.
 func (r *Remote) Lookup(ctx context.Context, name string) (key.Key, []client.Pack, error) {
@@ -233,24 +259,37 @@ func (r *Remote) Lookup(ctx context.Context, name string) (key.Key, []client.Pac
 		if err != nil {
 			return key.Key{}, nil, err
 		}
-		root, packs, err := client.New(c, r.http).Lookup(limited, name)
+		// first: the connection was up before this call and the lookup can
+		// still be repeated, so it does not wait long.
+		first := !c.fresh && !repeated
+		attempt, stop := limited, context.CancelFunc(func() {})
+		if first {
+			attempt, stop = r.firstAttempt(limited, c.link)
+		}
+		root, packs, err := client.New(c, r.http).Lookup(attempt, name)
+		cut := attempt.Err() != nil && limited.Err() == nil
+		stop()
 		if err == nil || answered(err) {
 			r.end(c, nil)
 			return root, packs, err
 		}
-		// No answer within the limit retires the connection as a broken
-		// stream does. A caller that left says nothing about it.
+		// No answer in time retires the connection as a broken stream
+		// does. A caller that left says nothing about it.
 		var silence error
-		if limited.Err() != nil && ctx.Err() == nil {
+		switch {
+		case cut:
+			// Of the lookups that are cut on one connection the first
+			// retires it and the others find it retired.
+			silence = fmt.Errorf("no answer to a lookup within %s", r.repeatAfter)
+			c.lost.Store(true)
+		case limited.Err() != nil && ctx.Err() == nil:
 			silence = fmt.Errorf("no answer to a lookup within %s", r.lookupTimeout)
 			c.lost.Store(true)
 		}
 		lost := r.end(c, errors.Join(silence, err))
 		switch {
-		case lost && !c.fresh && !repeated && limited.Err() == nil:
-			// The connection was up before this call and may have died
-			// since it was last used, as it does while the machine
-			// sleeps: once more on a fresh one.
+		case lost && first && limited.Err() == nil:
+			// Once more on a fresh one.
 			continue
 		case lost || limited.Err() != nil:
 			return key.Key{}, nil, unreachable(err)
@@ -259,6 +298,23 @@ func (r *Remote) Lookup(ctx context.Context, name string) (key.Key, []client.Pac
 			return key.Key{}, nil, err
 		}
 	}
+}
+
+// firstAttempt returns the context of a lookup's first attempt on l, a
+// connection that was up before the lookup: limited, ended after
+// RepeatAfter and when l is retired. The lookups that wait on a dead
+// connection are so released by the first that finds it out, and none
+// waits its own time on it.
+func (r *Remote) firstAttempt(limited context.Context, l *link) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(limited, r.repeatAfter)
+	go func() {
+		select {
+		case <-l.gone:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
 }
 
 // Fetch is client.Fetch; it has no time limit of its own. It asks nothing
@@ -372,7 +428,7 @@ func (r *Remote) startDial() *dialling {
 			d.err = errClosed
 		default:
 			r.links++
-			r.current = &link{conn: conn, id: r.links}
+			r.current = &link{conn: conn, id: r.links, gone: make(chan struct{})}
 			r.failure, r.failedAt = nil, time.Time{}
 		}
 		l, closed := r.current, r.closed
@@ -405,10 +461,7 @@ func (r *Remote) end(c *call, cause error) (lost bool) {
 	r.mu.Lock()
 	retiring := lost && !l.retired
 	if retiring {
-		l.retired = true
-		if r.current == l {
-			r.current = nil
-		}
+		r.retire(l)
 	}
 	l.calls--
 	last := l.retired && l.calls == 0
@@ -424,6 +477,16 @@ func (r *Remote) end(c *call, cause error) (lost bool) {
 		go r.closeLink(l)
 	}
 	return lost
+}
+
+// retire takes l out of use for new calls and tells the lookups that wait
+// on it. The caller holds r.mu and has seen that l is not retired.
+func (r *Remote) retire(l *link) {
+	l.retired = true
+	close(l.gone)
+	if r.current == l {
+		r.current = nil
+	}
 }
 
 func (r *Remote) closeLink(l *link) {
