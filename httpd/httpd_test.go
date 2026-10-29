@@ -137,6 +137,7 @@ type config struct {
 	limit     uint64 // of the cache; 0 means 1 GiB
 	priority  int
 	serveWait time.Duration
+	host      string // the name the cache is told it listens at
 	server    testserver.Options
 }
 
@@ -181,6 +182,7 @@ func newFixture(t *testing.T, cfg config) *fixture {
 		Key:       f.key,
 		Priority:  cfg.priority,
 		ServeWait: cfg.serveWait,
+		Host:      cfg.host,
 		Log:       log,
 	}))
 	t.Cleanup(f.ts.Close)
@@ -215,7 +217,7 @@ type answer struct {
 }
 
 // do sends a request to the handler and reads its answer. header is pairs
-// of a name and a value.
+// of a name and a value; Host is what the request calls the cache.
 func (f *fixture) do(method, target string, body []byte, header ...string) answer {
 	f.t.Helper()
 	var in io.Reader
@@ -227,6 +229,10 @@ func (f *fixture) do(method, target string, body []byte, header ...string) answe
 		f.t.Fatalf("%s %s: %v", method, target, err)
 	}
 	for i := 0; i+1 < len(header); i += 2 {
+		if header[i] == "Host" {
+			req.Host = header[i+1]
+			continue
+		}
 		req.Header.Set(header[i], header[i+1])
 	}
 	res, err := f.http.Do(req)
@@ -1174,4 +1180,156 @@ func TestServeWaitAnswers404(t *testing.T) {
 		return ok
 	})
 	f.want(http.StatusOK, http.MethodGet, "/"+p.hash+".narinfo", nil)
+}
+
+func TestNamed(t *testing.T) {
+	s := &server{host: "build.example"}
+	for _, host := range []string{
+		"127.0.0.1:8484", "127.0.0.1", "127.0.0.1:", "127.8.9.10:1",
+		"[::1]:8484", "[::1]", "::1",
+		"192.168.1.20:8484", "10.0.0.7", "[fe80::1%en0]:8484", "[2001:db8::1]:80", "0.0.0.0:8484", "[::]:8484",
+		"localhost:8484", "localhost", "LocalHost:8484",
+		"build.example:8484", "build.example", "BUILD.example:1",
+	} {
+		if !s.named(host) {
+			t.Errorf("a request with the Host %q is not taken for Nix's", host)
+		}
+	}
+	for _, host := range []string{
+		"", ":8484", "[]:8484",
+		"attacker.example:8484", "attacker.example", "[attacker.example]:8484",
+		"localhost.attacker.example:8484", "127.0.0.1.attacker.example", "build.example.attacker.example:8484",
+		"attacker.example:8484:127.0.0.1", "127.0.0.1 attacker.example",
+		"localhost.", "sub.localhost:8484", "other.example:8484", "build:8484",
+		"127.1:8484", "2130706433:8484", "0x7f.1",
+	} {
+		if s.named(host) {
+			t.Errorf("a request with the Host %q is taken for Nix's", host)
+		}
+	}
+	// A cache that was given an address and no name answers to no name
+	// but localhost.
+	if s := (&server{}); s.named("build.example:8484") || s.named("") || !s.named("localhost:8484") {
+		t.Error("a cache without a name of its own does not answer to localhost alone")
+	}
+	if s := (&server{host: "0.0.0.0"}); s.named("build.example:8484") || !s.named("192.168.1.20:8484") {
+		t.Error("a cache that listens at every address does not answer to addresses alone")
+	}
+}
+
+// A page in a browser reaches a cache on loopback under a name of its own
+// that it lets resolve to 127.0.0.1. Its requests carry that name as their
+// Host, and they are neither answered nor taken.
+func TestRequestsOfAWebPageAreRefused(t *testing.T) {
+	f := newFixture(t, config{host: "build.example"})
+	p := pathOf(t, "hello-2.12", smallTree(1))
+	f.upload(p)
+	planted := pathOf(t, "evil-1.0", smallTree(2))
+	const page = "attacker.example:8484"
+
+	// The uploads, as a page sends them: without a preflight, the name
+	// being the page's own.
+	for _, c := range []struct {
+		target string
+		body   []byte
+	}{
+		{"/nar/" + planted.narHash + ".nar", planted.archive},
+		{"/" + planted.hash + ".narinfo", planted.plain()},
+		{"/nar/" + p.narHash + ".nar", p.archive},
+		{"/nix-cache-info", []byte("x")},
+	} {
+		got := f.wantError(http.StatusForbidden, http.MethodPut, c.target, c.body, "Host", page, "Origin", "http://"+page)
+		if !strings.Contains(string(got.body), "attacker.example") {
+			t.Errorf("PUT %s: the body %q does not name the host that was refused", c.target, got.body)
+		}
+	}
+	// What it could read: nothing is there for it, and nothing is fetched.
+	f.bucket.forget()
+	for _, target := range []string{
+		"/nix-cache-info",
+		"/" + p.hash + ".narinfo",
+		"/nar/" + p.narHash + ".nar",
+		"/",
+	} {
+		f.wantError(http.StatusNotFound, http.MethodGet, target, nil, "Host", page)
+		f.want(http.StatusNotFound, http.MethodHead, target, nil, "Host", page)
+	}
+	f.wantError(http.StatusNotFound, http.MethodOptions, "/nar/"+planted.narHash+".nar", nil,
+		"Host", page, "Origin", "http://"+page, "Access-Control-Request-Method", "PUT")
+	f.settled()
+	if names := f.staged(); len(names) != 0 {
+		t.Errorf("staging holds %v after uploads that were all refused", names)
+	}
+	if f.onServer(f.store.ContentName(planted.narHash)) || f.onServer(f.store.NarinfoName(planted.hash)) {
+		t.Error("the server has a reference a web page sent")
+	}
+	if !f.log.has("level=WARN", "attacker.example", "/nar/"+planted.narHash+".nar") {
+		t.Errorf("the log does not say that a request was refused:\n%s", f.log)
+	}
+
+	// Under an address, under localhost and under the name the cache was
+	// given, Nix is answered and its uploads are taken.
+	for _, host := range []string{"127.0.0.1:8484", "[::1]:8484", "192.168.1.20:8484", "localhost:8484", "build.example:8484", "build.example"} {
+		f.want(http.StatusOK, http.MethodGet, "/nix-cache-info", nil, "Host", host)
+		f.want(http.StatusOK, http.MethodHead, "/"+p.hash+".narinfo", nil, "Host", host)
+		got := f.want(http.StatusOK, http.MethodGet, "/nar/"+p.narHash+".nar", nil, "Host", host)
+		if !bytes.Equal(got.body, p.archive) {
+			t.Errorf("under the Host %s the NAR is not the archive", host)
+		}
+	}
+	lan := pathOf(t, "lan-1.0", smallTree(3))
+	f.want(http.StatusOK, http.MethodPut, "/nar/"+lan.narHash+".nar", lan.archive, "Host", "192.168.1.20:8484")
+	f.want(http.StatusOK, http.MethodPut, "/"+lan.hash+".narinfo", lan.plain(), "Host", "build.example:8484")
+
+	// A page of another site that names the cache by its address is
+	// cross-origin: the browser says where the request comes from, which
+	// Nix never does.
+	other := pathOf(t, "other-1.0", smallTree(4))
+	f.wantError(http.StatusForbidden, http.MethodPut, "/nar/"+other.narHash+".nar", other.archive, "Origin", "http://attacker.example")
+	f.wantError(http.StatusForbidden, http.MethodPut, "/"+other.hash+".narinfo", other.plain(), "Origin", "null")
+	f.bucket.forget()
+	for _, site := range []string{"cross-site", "same-site"} {
+		f.wantError(http.StatusNotFound, http.MethodGet, "/nar/"+p.narHash+".nar", nil, "Sec-Fetch-Site", site)
+		f.wantError(http.StatusNotFound, http.MethodGet, "/"+p.hash+".narinfo", nil, "Sec-Fetch-Site", site)
+		f.wantError(http.StatusForbidden, http.MethodPut, "/nar/"+other.narHash+".nar", other.archive, "Sec-Fetch-Site", site)
+	}
+	// Someone who types the address into a browser is no page, and reading
+	// is not refused for an Origin: the browser keeps the answer from a
+	// page of another origin by itself.
+	f.want(http.StatusOK, http.MethodGet, "/nix-cache-info", nil, "Sec-Fetch-Site", "none")
+	f.want(http.StatusOK, http.MethodGet, "/nix-cache-info", nil, "Origin", "http://attacker.example")
+	f.settled()
+	if names := f.staged(); len(names) != 0 {
+		t.Errorf("staging holds %v after uploads that were all refused", names)
+	}
+	if f.onServer(f.store.ContentName(other.narHash)) {
+		t.Error("the server has a reference a web page sent")
+	}
+}
+
+// A refused upload is answered before its body is read.
+func TestRefusedUploadIsNotRead(t *testing.T) {
+	f := newFixture(t, config{})
+	body := &slowBody{size: 256 << 20}
+	req, err := http.NewRequestWithContext(background(t), http.MethodPut, f.ts.URL+"/nar/"+fileHash([]byte("x"))+".nar", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.ContentLength = body.size
+	req.Host = "attacker.example:8484"
+	res, err := f.http.Do(req)
+	if err != nil {
+		t.Fatalf("PUT: %v", err)
+	}
+	defer res.Body.Close()
+	text, _ := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("status %d (%q), want 403", res.StatusCode, text)
+	}
+	if sent := body.read.Load(); sent >= body.size/2 {
+		t.Errorf("%d of %d bytes were taken from the body before the answer", sent, body.size)
+	}
+	if names := f.staged(); len(names) != 0 {
+		t.Errorf("staging holds %v after an upload that was refused", names)
+	}
 }

@@ -18,6 +18,13 @@
 // once. The body of an error is one line of plain text under 1024 bytes,
 // which is as much as Nix shows.
 //
+// Nix is the one client, and whoever can reach the port is not: a page in
+// a browser on the same machine can. Nix calls the cache by an address, by
+// localhost or by the name it was given, and says nothing of where its
+// requests come from. A request with another Host, an upload with an
+// Origin, and a request the browser marks as another site's are a page's:
+// the upload is answered 403 and the rest 404, before anything is read.
+//
 // Nothing of a NAR is sent before its reference is local and checked.
 // After the header a failure can only be shown by cutting the connection,
 // and that is what happens.
@@ -29,7 +36,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"path"
 	"strconv"
 	"strings"
@@ -69,7 +78,11 @@ type Config struct {
 	Key       narinfo.SigningKey
 	Priority  int
 	ServeWait time.Duration // 0 means 240 s: how long a narinfo or NAR request waits for its reference
-	Log       *slog.Logger
+	// Host is the host the cache listens at. When it is a name, requests
+	// that call the cache by it are answered; requests that call it by an
+	// IP address or localhost always are.
+	Host string
+	Log  *slog.Logger
 }
 
 // server is the handler's state.
@@ -79,6 +92,7 @@ type server struct {
 	key       narinfo.SigningKey
 	cacheInfo []byte
 	wait      time.Duration
+	host      string
 	log       *slog.Logger
 }
 
@@ -91,6 +105,7 @@ func New(cfg Config) http.Handler {
 		cacheInfo: fmt.Appendf(nil, "StoreDir: %s\nWantMassQuery: 1\nPriority: %d\n",
 			narinfo.StoreDir, cfg.Priority),
 		wait: cfg.ServeWait,
+		host: cfg.Host,
 		log:  cfg.Log,
 	}
 	if s.wait <= 0 {
@@ -118,6 +133,11 @@ func New(cfg Config) http.Handler {
 			s.log.Debug("request", "method", r.Method, "path", r.URL.Path,
 				"status", seen.code(), "bytes", seen.bytes, "took", time.Since(began))
 		}()
+		// Before anything of the request is looked at or read.
+		if why := s.foreign(r); why != "" {
+			s.refuse(seen, r, why)
+			return
+		}
 		// The mux would redirect a path such as //x or /a/../x to its
 		// clean form. No path of the cache is written that way.
 		if p := r.URL.Path; path.Clean(p) != p {
@@ -126,6 +146,59 @@ func New(cfg Config) http.Handler {
 		}
 		mux.ServeHTTP(seen, r)
 	})
+}
+
+// named reports whether hostport, the Host of a request, is something Nix
+// calls this cache: an IP address, localhost, or the name the cache was
+// told it listens at, each with or without a port. A name that a page has
+// pointed at this machine is none of them, whatever it is made to look
+// like.
+func (s *server) named(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	} else if n := len(host); n > 1 && host[0] == '[' && host[n-1] == ']' {
+		host = host[1 : n-1]
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return true
+	}
+	return strings.EqualFold(host, "localhost") || s.host != "" && strings.EqualFold(host, s.host)
+}
+
+// foreign says why a request is not Nix's but a web page's, and nothing
+// for one that may be Nix's.
+//
+// A page reaches a cache on loopback in two ways. Under a name of its own
+// that it lets resolve to this machine it is, to the browser, the cache's
+// own page, and may send and read what it likes: the Host of its requests
+// is that name. Under the cache's address it is a page of another origin,
+// which may read no answer and send no PUT unasked, and whose browser
+// says of each request where it comes from. Nix says neither.
+func (s *server) foreign(r *http.Request) string {
+	if !s.named(r.Host) {
+		return fmt.Sprintf("narrenhaus is not called %.100q: it answers to an IP address, to localhost "+
+			"and to the host name it was told to listen at", r.Host)
+	}
+	if origin := r.Header.Values("Origin"); len(origin) > 0 && r.Method == http.MethodPut {
+		return fmt.Sprintf("narrenhaus takes no upload from a web page, and this one comes from %.100q", origin[0])
+	}
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "none" && site != "same-origin" {
+		return "narrenhaus does not answer the page of another site"
+	}
+	return ""
+}
+
+// refuse answers a request that is not Nix's: an upload with the reason,
+// anything else as what is not there.
+func (s *server) refuse(w http.ResponseWriter, r *http.Request, why string) {
+	s.log.Warn("a request that does not come from Nix was refused",
+		"method", r.Method, "path", r.URL.Path, "host", r.Host, "reason", why)
+	if r.Method == http.MethodPut {
+		fail(w, r, http.StatusForbidden, why)
+		return
+	}
+	notFound(w, r)
 }
 
 // observed notes what a handler answered, for the log.
