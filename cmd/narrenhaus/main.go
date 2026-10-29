@@ -31,9 +31,6 @@ import (
 // with -ldflags "-X main.version=..."; any other build is "dev".
 var version = "dev"
 
-// errNotImplemented is what serve and check answer until they are written.
-var errNotImplemented = errors.New("not implemented")
-
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -120,12 +117,17 @@ func newApp(stdout, stderr io.Writer) *cli.App {
 			{
 				Name:  "serve",
 				Usage: "say what the Nix configuration lacks, then serve the binary cache",
+				Description: "serve writes to standard error: what the Nix configuration lacks to use it,\n" +
+					"the address it serves at, then a line for each upload and each NAR served.\n" +
+					"It serves whether Nix is set up for it or not. On SIGINT or SIGTERM it stops\n" +
+					"once the requests that are running have finished, or after ten seconds.",
 				Flags: optionFlags(),
 				Action: func(c *cli.Context) error {
-					if _, err := loadOptions(c); err != nil {
+					opts, err := loadOptions(c)
+					if err != nil {
 						return err
 					}
-					return errNotImplemented
+					return serve(c.Context, opts, c.App.ErrWriter, thisHost())
 				},
 			},
 			{
@@ -135,10 +137,11 @@ func newApp(stdout, stderr io.Writer) *cli.App {
 					"so that the command line of serve can be given to it as it is.",
 				Flags: optionFlags(),
 				Action: func(c *cli.Context) error {
-					if _, err := loadCheckOptions(c); err != nil {
+					opts, err := loadCheckOptions(c)
+					if err != nil {
 						return err
 					}
-					return errNotImplemented
+					return check(c.Context, opts, c.App.Writer)
 				},
 			},
 		},

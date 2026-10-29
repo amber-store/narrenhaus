@@ -2,16 +2,36 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"encoding/base32"
+	"errors"
+	"fmt"
 	"io"
+	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/amber-store/core/reference"
+	"github.com/amber-store/jaccard-store/node"
 	irohkey "github.com/tmc/go-iroh/key"
 	"github.com/urfave/cli/v2"
+
+	"github.com/amber-store/narrenhaus/nar"
+	"github.com/amber-store/narrenhaus/narinfo"
+	"github.com/amber-store/narrenhaus/nix32"
+	"github.com/amber-store/narrenhaus/packcache"
+	"github.com/amber-store/narrenhaus/remote"
+	"github.com/amber-store/narrenhaus/testserver"
 )
 
 // testServer is the public key of RFC 8032's first test vector, in the hex
@@ -380,14 +400,199 @@ func TestServeHelpListsTheOptions(t *testing.T) {
 	}
 }
 
-func TestServeValidatesItsOptions(t *testing.T) {
-	clearEnvironment(t)
-	dir := t.TempDir()
-	good := []string{"serve", "--server", testServer, "--prefix", "acme/", "--cache-dir", dir, "--config-dir", dir}
+// syncBuffer is a buffer the command writes to while the test reads it.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
 
-	_, _, err := run(t, good...)
-	if err == nil || err.Error() != "not implemented" {
-		t.Fatalf("serve with good options: error %v, want \"not implemented\"", err)
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// runContext runs the whole command in-process under ctx, which stands for
+// the signals: when it ends, serve stops.
+func runContext(t *testing.T, ctx context.Context, args ...string) (stdout, stderr string, err error) {
+	t.Helper()
+	var out, errOut syncBuffer
+	err = newApp(&out, &errOut).RunContext(ctx, append([]string{"narrenhaus"}, args...))
+	return out.String(), errOut.String(), err
+}
+
+// noNix takes every program off PATH, so that the setup check finds no nix
+// and says the same on every machine.
+func noNix(t *testing.T) {
+	t.Helper()
+	t.Setenv("PATH", "")
+}
+
+// daemon is a serve that runs in this process.
+type daemon struct {
+	t       *testing.T
+	log     *syncBuffer // what it wrote to standard error
+	url     string      // where it serves, from its log
+	cancel  context.CancelFunc
+	stopped chan struct{}
+	err     error // what it returned, once stopped is closed
+}
+
+// servingLine is the line serve logs once it serves, with the URL.
+var servingLine = regexp.MustCompile(`(?m)^.* msg=serving url=(http://\S+).*$`)
+
+// startDaemon runs a serve and waits until it says that it serves. The
+// test's end stops it, and prints what it wrote when the test failed or
+// NARRENHAUS_TEST_LOG is set.
+func startDaemon(t *testing.T, serve func(ctx context.Context, stderr io.Writer) error) *daemon {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	d := &daemon{t: t, log: &syncBuffer{}, cancel: cancel, stopped: make(chan struct{})}
+	go func() {
+		defer close(d.stopped)
+		d.err = serve(ctx, d.log)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-d.stopped:
+		case <-time.After(time.Minute):
+			t.Errorf("serve did not stop:\n%s", d.log.String())
+		}
+		if t.Failed() || os.Getenv("NARRENHAUS_TEST_LOG") != "" {
+			t.Logf("what serve wrote to standard error:\n%s", d.log.String())
+		}
+	})
+	for end := time.Now().Add(30 * time.Second); ; {
+		if m := servingLine.FindStringSubmatch(d.log.String()); m != nil {
+			d.url = m[1]
+			return d
+		}
+		select {
+		case <-d.stopped:
+			t.Fatalf("serve returned before it served: %v\n%s", d.err, d.log.String())
+		case <-time.After(2 * time.Millisecond):
+		}
+		if time.Now().After(end) {
+			t.Fatalf("serve never said that it serves:\n%s", d.log.String())
+		}
+	}
+}
+
+// stop ends the daemon as a signal does and returns what serve returned.
+func (d *daemon) stop() error {
+	d.t.Helper()
+	d.cancel()
+	return d.wait(time.Minute)
+}
+
+// wait waits for serve to return.
+func (d *daemon) wait(limit time.Duration) error {
+	d.t.Helper()
+	select {
+	case <-d.stopped:
+		return d.err
+	case <-time.After(limit):
+		d.t.Fatalf("serve did not return within %v:\n%s", limit, d.log.String())
+		return nil
+	}
+}
+
+// running reports whether serve has not returned yet.
+func (d *daemon) running() bool {
+	select {
+	case <-d.stopped:
+		return false
+	default:
+		return true
+	}
+}
+
+// do sends a request to the daemon and reads the answer.
+func (d *daemon) do(method, target string, body io.Reader) (status int, got []byte, err error) {
+	req, err := http.NewRequest(method, d.url+target, body)
+	if err != nil {
+		return 0, nil, err
+	}
+	res, err := http.DefaultTransport.RoundTrip(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer res.Body.Close()
+	got, err = io.ReadAll(res.Body)
+	return res.StatusCode, got, err
+}
+
+// want is do with the status the answer must have.
+func (d *daemon) want(status int, method, target string, body []byte) []byte {
+	d.t.Helper()
+	var in io.Reader
+	if body != nil {
+		in = bytes.NewReader(body)
+	}
+	code, got, err := d.do(method, target, in)
+	if err != nil {
+		d.t.Fatalf("%s %s: %v\n%s", method, target, err, d.log.String())
+	}
+	if code != status {
+		d.t.Fatalf("%s %s: status %d (%q), want %d\n%s", method, target, code, got, status, d.log.String())
+	}
+	return got
+}
+
+// serveArgs is a command line of serve that is good: the test's server ID,
+// a port the system chooses, and directories under dir.
+func serveArgs(dir string, more ...string) []string {
+	return append([]string{
+		"serve",
+		"--server", testServer,
+		"--prefix", "acme/",
+		"--listen", "127.0.0.1:0",
+		"--cache-dir", filepath.Join(dir, "cache"),
+		"--config-dir", filepath.Join(dir, "config"),
+	}, more...)
+}
+
+// Bad start-up input is one line that names the option and no panic, and
+// serve does not start.
+func TestServeRefusesBadOptions(t *testing.T) {
+	clearEnvironment(t)
+	noNix(t)
+
+	// A port something else listens on.
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+
+	// serve is given a minute: one that starts instead of refusing runs
+	// until then and returns no error, which fails the test.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	refused := func(name string, args ...string) string {
+		t.Helper()
+		_, stderr, err := runContext(t, ctx, args...)
+		if err == nil {
+			t.Errorf("serve %q: no error\n%s", args, stderr)
+			return ""
+		}
+		if !strings.Contains(err.Error(), name) {
+			t.Errorf("serve %q: error %q does not name %s", args, err, name)
+		}
+		if strings.Contains(err.Error(), "\n") {
+			t.Errorf("serve %q: error %q is more than one line", args, err)
+		}
+		if strings.Contains(stderr, "msg=serving") {
+			t.Errorf("serve %q served before it refused:\n%s", args, stderr)
+		}
+		return err.Error()
 	}
 
 	for _, tc := range []struct {
@@ -398,30 +603,130 @@ func TestServeValidatesItsOptions(t *testing.T) {
 		{"--server", []string{"--server", "nonsense"}},
 		{"--cache-size", []string{"--cache-size", "0"}},
 		{"--cache-size", []string{"--cache-size", "lots"}},
+		{"--listen", []string{"--listen", busy.Addr().String()}},
+		{"--listen", []string{"--listen", "nowhere"}},
 	} {
-		_, _, err := run(t, append(append([]string{}, good...), tc.args...)...)
-		if err == nil || !strings.Contains(err.Error(), tc.name) {
-			t.Errorf("serve %q: error %v, want one naming %s", tc.args, err, tc.name)
+		dir := t.TempDir()
+		msg := refused(tc.name, serveArgs(dir, tc.args...)...)
+		if !strings.Contains(msg, tc.args[1]) {
+			t.Errorf("serve %q: error %q does not show the value", tc.args, msg)
 		}
 	}
 
-	_, _, err = run(t, "serve")
-	if err == nil || err.Error() == "not implemented" {
-		t.Errorf("serve without options: error %v, want one about a missing option", err)
+	// Without options it is the server that is missing.
+	refused("--server", "serve")
+
+	// A key file that holds no key is named and left as it is.
+	for _, file := range []string{"client.key", "signing.key"} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config", file)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("not a key\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		msg := refused("--config-dir", serveArgs(dir)...)
+		if !strings.Contains(msg, path) {
+			t.Errorf("a broken %s: error %q does not name the file", file, msg)
+		}
+		if got, err := os.ReadFile(path); err != nil || string(got) != "not a key\n" {
+			t.Errorf("a broken %s was changed: %q, %v", file, got, err)
+		}
+	}
+
+	// A cache directory that cannot be one.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "cache"), []byte("a file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if msg := refused("--cache-dir", serveArgs(dir)...); !strings.Contains(msg, filepath.Join(dir, "cache")) {
+		t.Errorf("a cache directory that is a file: error %q does not name it", msg)
 	}
 }
 
-// check needs the address and the configuration directory and nothing else.
+// check needs the address and the configuration directory and nothing else,
+// and no nix either: it then prints the lines to add.
 func TestCheckNeedsNoServer(t *testing.T) {
 	clearEnvironment(t)
-	_, _, err := run(t, "check", "--listen", "127.0.0.1:1", "--config-dir", t.TempDir())
-	if err == nil || err.Error() != "not implemented" {
-		t.Fatalf("check: error %v, want \"not implemented\"", err)
+	noNix(t)
+	dir := filepath.Join(t.TempDir(), "config")
+
+	stdout, stderr, err := run(t, "check", "--listen", "127.0.0.1:1", "--config-dir", dir)
+	if err != nil {
+		t.Fatalf("check: %v", err)
 	}
-	_, _, err = run(t, "check")
-	if err == nil || err.Error() != "not implemented" {
-		t.Fatalf("check with the defaults: error %v, want \"not implemented\"", err)
+	if stderr != "" {
+		t.Errorf("check wrote to standard error: %q", stderr)
 	}
+	// The key it printed is the one it made and kept.
+	key, err := narinfo.LoadOrCreateSigningKey(filepath.Join(dir, "signing.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(key.Public(), "narrenhaus-") {
+		t.Errorf("the signing key is named %q", key.Public())
+	}
+	for _, want := range []string{
+		"    extra-substituters = http://127.0.0.1:1\n",
+		"    extra-trusted-public-keys = " + key.Public() + "\n",
+		"    fallback = true\n",
+		"nix copy --to 'http://127.0.0.1:1?compression=none'",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("check does not print %q:\n%s", want, stdout)
+		}
+	}
+	if !strings.HasSuffix(stdout, "\n") || strings.HasSuffix(stdout, "\n\n") {
+		t.Errorf("check's output does not end with one line feed:\n%q", stdout)
+	}
+	// It made that key and nothing else: the key shown to the server is
+	// serve's business.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "signing.key" {
+		t.Errorf("check left %v in the configuration directory, want signing.key alone", entries)
+	}
+
+	// A second run says the same.
+	again, _, err := run(t, "check", "--listen", "127.0.0.1:1", "--config-dir", dir)
+	if err != nil || again != stdout {
+		t.Errorf("a second check: %v\n%s\nwant what the first printed:\n%s", err, again, stdout)
+	}
+
+	// The options of serve are taken and not looked at.
+	other, _, err := run(t, "check", "--listen", "127.0.0.1:1", "--config-dir", dir,
+		"--server", "nonsense", "--prefix", "a@b/", "--cache-size", "0", "--cache-dir", "")
+	if err != nil || other != stdout {
+		t.Errorf("check with options of serve that are wrong: %v\n%s", err, other)
+	}
+
+	// With the defaults the key is under the user's configuration
+	// directory.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+	stdout, _, err = run(t, "check")
+	if err != nil {
+		t.Fatalf("check with the defaults: %v", err)
+	}
+	config, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(config, home) {
+		t.Fatalf("the user's configuration directory is %s, not under the test's home", config)
+	}
+	key, err = narinfo.LoadOrCreateSigningKey(filepath.Join(config, "narrenhaus", "signing.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout, "extra-substituters = http://127.0.0.1:8484\n") || !strings.Contains(stdout, key.Public()) {
+		t.Errorf("check with the defaults:\n%s", stdout)
+	}
+
 	for _, tc := range []struct {
 		name string
 		args []string
@@ -432,6 +737,453 @@ func TestCheckNeedsNoServer(t *testing.T) {
 		_, _, err := run(t, append([]string{"check"}, tc.args...)...)
 		if err == nil || !strings.Contains(err.Error(), tc.name) {
 			t.Errorf("check %q: error %v, want one naming %s", tc.args, err, tc.name)
+		}
+	}
+	// A signing key that is no key is an error that names the file.
+	bad := filepath.Join(t.TempDir(), "signing.key")
+	if err := os.WriteFile(bad, []byte("not a key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = run(t, "check", "--config-dir", filepath.Dir(bad))
+	if err == nil || !strings.Contains(err.Error(), bad) || !strings.Contains(err.Error(), "--config-dir") {
+		t.Errorf("check with a broken signing key: error %v, want one naming --config-dir and %s", err, bad)
+	}
+}
+
+// keyFiles reads the two key files under the configuration directory.
+func keyFiles(t *testing.T, config string) (client, signing []byte) {
+	t.Helper()
+	for _, f := range []struct {
+		name string
+		into *[]byte
+	}{{"client.key", &client}, {"signing.key", &signing}} {
+		path := filepath.Join(config, f.name)
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mode := info.Mode().Perm(); mode != 0o600 {
+			t.Errorf("%s has mode %o, want 600", f.name, mode)
+		}
+		if *f.into, err = os.ReadFile(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return client, signing
+}
+
+func TestServeCreatesBothKeys(t *testing.T) {
+	clearEnvironment(t)
+	noNix(t)
+	dir := t.TempDir()
+	config := filepath.Join(dir, "config")
+
+	d := startDaemon(t, func(ctx context.Context, stderr io.Writer) error {
+		return newApp(io.Discard, stderr).RunContext(ctx, append([]string{"narrenhaus"}, serveArgs(dir, "--priority", "45")...))
+	})
+	client, signing := keyFiles(t, config)
+	if info, err := os.Stat(config); err != nil || info.Mode().Perm() != 0o700 {
+		t.Errorf("the configuration directory: %v, %v, want mode 700", info, err)
+	}
+	// Both are keys of their kind.
+	sk, err := node.LoadOrCreateKey(filepath.Join(config, "client.key"))
+	if err != nil {
+		t.Errorf("client.key: %v", err)
+	}
+	if sk.Public().EndpointID().String() == testServer {
+		t.Errorf("client.key is the server's key")
+	}
+	key, err := narinfo.LoadOrCreateSigningKey(filepath.Join(config, "signing.key"))
+	if err != nil {
+		t.Fatalf("signing.key: %v", err)
+	}
+
+	// Standard error: the check's advice for the address it serves at and
+	// for its key, then that it serves.
+	log := d.log.String()
+	for _, want := range []string{
+		"    extra-substituters = " + d.url + "\n",
+		"    extra-trusted-public-keys = " + key.Public() + "\n",
+		"    fallback = true\n",
+	} {
+		if !strings.Contains(log, want) {
+			t.Errorf("serve does not print %q:\n%s", want, log)
+		}
+	}
+	if advice, line := strings.Index(log, "extra-substituters"), strings.Index(log, "msg=serving"); advice < 0 || line < advice {
+		t.Errorf("serve says that it serves before the advice:\n%s", log)
+	}
+	if strings.HasSuffix(d.url, ":0") {
+		t.Errorf("serve says it serves at %s, not at the port it got", d.url)
+	}
+
+	// It serves, with the priority it was given, and without the server:
+	// nothing has asked for a path.
+	if got := string(d.want(http.StatusOK, http.MethodGet, "/nix-cache-info", nil)); got != "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 45\n" {
+		t.Errorf("nix-cache-info is %q", got)
+	}
+
+	if err := d.stop(); err != nil {
+		t.Errorf("serve returned %v when it was stopped", err)
+	}
+	if _, _, err := d.do(http.MethodGet, "/nix-cache-info", nil); err == nil {
+		t.Errorf("serve still answers after it returned")
+	}
+	if !strings.Contains(d.log.String(), "msg=stopped") {
+		t.Errorf("serve does not say that it stopped:\n%s", d.log.String())
+	}
+
+	// A second start finds the keys and keeps them.
+	d = startDaemon(t, func(ctx context.Context, stderr io.Writer) error {
+		return newApp(io.Discard, stderr).RunContext(ctx, append([]string{"narrenhaus"}, serveArgs(dir)...))
+	})
+	clientAgain, signingAgain := keyFiles(t, config)
+	if !bytes.Equal(client, clientAgain) || !bytes.Equal(signing, signingAgain) {
+		t.Errorf("a second start changed a key")
+	}
+	if !strings.Contains(d.log.String(), key.Public()) {
+		t.Errorf("the second start advises another key:\n%s", d.log.String())
+	}
+	if err := d.stop(); err != nil {
+		t.Errorf("serve returned %v when it was stopped", err)
+	}
+}
+
+// testPath is a small store path as Nix uploads it with ?compression=none.
+type testPath struct {
+	hash    string // of the store path
+	archive []byte
+	narHash string // in Nix's base 32
+	narinfo []byte
+}
+
+func newTestPath(t *testing.T, body string) testPath {
+	t.Helper()
+	var buf bytes.Buffer
+	w := nar.NewWriter(&buf)
+	if err := w.Directory(""); err != nil {
+		t.Fatal(err)
+	}
+	f, err := w.Regular("hello", false, uint64(len(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(f, body); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Leave(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	p := testPath{archive: buf.Bytes()}
+	sum := sha256.Sum256(p.archive)
+	p.narHash = nix32.Encode(sum[:])
+	of := sha256.Sum256([]byte("the store path of " + body))
+	p.hash = nix32.Encode(of[:20])
+	p.narinfo = fmt.Appendf(nil, "StorePath: /nix/store/%s-hello\nURL: nar/%s.nar\nCompression: none\n"+
+		"FileHash: sha256:%s\nFileSize: %d\nNarHash: sha256:%s\nNarSize: %d\nReferences: \n",
+		p.hash, p.narHash, p.narHash, len(p.archive), p.narHash, len(p.archive))
+	return p
+}
+
+// testOptions are options of serve that are good, with directories under
+// dir and a port the system chooses.
+func testOptions(t *testing.T, dir string) options {
+	t.Helper()
+	id, err := irohkey.ParseEndpointID(testServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return options{
+		Server:    id,
+		Prefix:    "acme/",
+		Listen:    "127.0.0.1:0",
+		CacheDir:  filepath.Join(dir, "cache"),
+		CacheSize: 1 << 30,
+		ConfigDir: filepath.Join(dir, "config"),
+		Priority:  30,
+	}
+}
+
+// hostOf is the machine of a test: the server is the one in this process,
+// whatever ID the options name, and requests get grace to finish.
+func hostOf(srv *testserver.Server, grace time.Duration) host {
+	return host{
+		connect: func(irohkey.SecretKey, irohkey.EndpointID, *slog.Logger) func(context.Context) (remote.Conn, error) {
+			return srv.Dial()
+		},
+		grace: grace,
+	}
+}
+
+// startServe runs serve itself, past the command line.
+func startServe(t *testing.T, opts options, h host) *daemon {
+	t.Helper()
+	return startDaemon(t, func(ctx context.Context, stderr io.Writer) error {
+		return serve(ctx, opts, stderr, h)
+	})
+}
+
+// logged counts the lines of the daemon's log with the message msg.
+func (d *daemon) logged(msg string) int {
+	if strings.Contains(msg, " ") {
+		msg = strconv.Quote(msg)
+	}
+	log := d.log.String()
+	return strings.Count(log, " msg="+msg+" ") + strings.Count(log, " msg="+msg+"\n")
+}
+
+// serve is the whole cache: what is uploaded to it is on the server and
+// comes back signed with its key, each with a line in the log; and the
+// cache directory is its own while it runs and free afterwards.
+func TestServeUploadsAndServes(t *testing.T) {
+	clearEnvironment(t)
+	noNix(t)
+	srv := testserver.Start(t, testserver.Options{})
+	dir := t.TempDir()
+	opts := testOptions(t, dir)
+	d := startServe(t, opts, hostOf(srv, 10*time.Second))
+	p := newTestPath(t, "hello, world\n")
+
+	if got := string(d.want(http.StatusOK, http.MethodGet, "/nix-cache-info", nil)); !strings.Contains(got, "Priority: 30\n") {
+		t.Errorf("nix-cache-info is %q", got)
+	}
+	d.want(http.StatusNotFound, http.MethodGet, "/"+p.hash+".narinfo", nil)
+	d.want(http.StatusNotFound, http.MethodHead, "/nar/"+p.narHash+".nar", nil)
+	d.want(http.StatusOK, http.MethodPut, "/nar/"+p.narHash+".nar", p.archive)
+	d.want(http.StatusOK, http.MethodPut, "/"+p.hash+".narinfo", p.narinfo)
+	if d.logged("content pushed") != 1 || d.logged("narinfo pushed") != 1 {
+		t.Errorf("the log has no one line for each push:\n%s", d.log.String())
+	}
+
+	// Both references are on the server under the prefix.
+	refs, err := srv.Client(t).List(context.Background(), "acme/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, r := range refs {
+		names = append(names, r.Name)
+	}
+	slices.Sort(names)
+	if want := []string{"acme/" + p.hash + ".narinfo", "acme/nar/" + p.narHash + ".nar"}; !slices.Equal(names, want) {
+		t.Errorf("the server has the references %q, want %q", names, want)
+	}
+
+	// The narinfo comes back signed with the key of the configuration
+	// directory.
+	key, err := narinfo.LoadOrCreateSigningKey(filepath.Join(opts.ConfigDir, "signing.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := narinfo.Parse(d.want(http.StatusOK, http.MethodGet, "/"+p.hash+".narinfo", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := key.Sign(info.Fingerprint()); !slices.Equal(info.Sigs, []string{want}) {
+		t.Errorf("the narinfo is signed %q, want %q", info.Sigs, want)
+	}
+	if info.URL != "nar/"+p.narHash+".nar" || info.Compression != "none" {
+		t.Errorf("the narinfo names the NAR as %q with compression %q", info.URL, info.Compression)
+	}
+
+	// The NAR, with one line in the log; what is not served has none.
+	if d.logged("NAR served") != 0 {
+		t.Errorf("the log says a NAR was served before one was asked for:\n%s", d.log.String())
+	}
+	if got := d.want(http.StatusOK, http.MethodGet, "/"+info.URL, nil); !bytes.Equal(got, p.archive) {
+		t.Errorf("the NAR that came back is not the one sent")
+	}
+	d.want(http.StatusNotFound, http.MethodGet, "/nar/"+strings.Repeat("0", 52)+".nar", nil)
+	d.want(http.StatusOK, http.MethodHead, "/nar/"+p.narHash+".nar", nil)
+	if d.logged("NAR served") != 1 {
+		t.Errorf("the log has no one line for the NAR served:\n%s", d.log.String())
+	}
+	if strings.Contains(d.log.String(), "level=DEBUG") {
+		t.Errorf("the log has debug lines:\n%s", d.log.String())
+	}
+
+	// A second narrenhaus on the same cache directory is refused, and the
+	// first goes on.
+	second := opts
+	second.ConfigDir = filepath.Join(dir, "config2")
+	err = serve(context.Background(), second, io.Discard, hostOf(srv, time.Second))
+	if err == nil || !strings.Contains(err.Error(), "--cache-dir") || !strings.Contains(err.Error(), opts.CacheDir) ||
+		!errors.Is(err, packcache.ErrInUse) || strings.Contains(err.Error(), "\n") {
+		t.Errorf("a second serve on the cache directory: error %v, want one line naming --cache-dir and the directory", err)
+	}
+	d.want(http.StatusOK, http.MethodGet, "/"+p.hash+".narinfo", nil)
+
+	if err := d.stop(); err != nil {
+		t.Errorf("serve returned %v when it was stopped", err)
+	}
+
+	// The directory belongs to the server and the prefix: another prefix
+	// is refused, and so is another server.
+	other := opts
+	other.Prefix = "other/"
+	err = serve(context.Background(), other, io.Discard, hostOf(srv, time.Second))
+	if err == nil || !strings.Contains(err.Error(), "--cache-dir") || !strings.Contains(err.Error(), opts.CacheDir) ||
+		!errors.Is(err, packcache.ErrOrigin) || strings.Contains(err.Error(), "\n") {
+		t.Errorf("serve with another prefix on the cache directory: error %v, want one line naming --cache-dir and the directory", err)
+	}
+	cache, err := packcache.Open(opts.CacheDir, opts.CacheSize, packcache.Origin{Server: "another", Prefix: opts.Prefix})
+	if !errors.Is(err, packcache.ErrOrigin) || !strings.Contains(err.Error(), testServer) {
+		if err == nil {
+			cache.Close()
+		}
+		t.Errorf("the cache directory opened for another server: %v, want a refusal that names %s", err, testServer)
+	}
+
+	// Started again, it serves what it has in the cache, and does not ask
+	// the server for the NAR.
+	srv.Stop()
+	d = startServe(t, opts, hostOf(srv, time.Second))
+	if got := d.want(http.StatusOK, http.MethodGet, "/nar/"+p.narHash+".nar", nil); !bytes.Equal(got, p.archive) {
+		t.Errorf("the NAR after a restart is not the one sent")
+	}
+}
+
+// uploading waits until the daemon whose cache directory is cache has
+// begun to stage an upload, which is when the upload's request has reached
+// the handler.
+func uploading(t *testing.T, cache string) {
+	t.Helper()
+	for end := time.Now().Add(30 * time.Second); time.Now().Before(end); time.Sleep(2 * time.Millisecond) {
+		if entries, err := os.ReadDir(filepath.Join(cache, "staging")); err == nil && len(entries) > 0 {
+			return
+		}
+	}
+	t.Fatalf("no upload was staged under %s", cache)
+}
+
+// A request that runs when the signal comes is let finish.
+func TestServeLetsARunningRequestFinish(t *testing.T) {
+	clearEnvironment(t)
+	noNix(t)
+	srv := testserver.Start(t, testserver.Options{})
+	opts := testOptions(t, t.TempDir())
+	d := startServe(t, opts, hostOf(srv, 30*time.Second))
+	p := newTestPath(t, strings.Repeat("a request that is under way\n", 4000))
+
+	// An upload that has sent its first half.
+	body, feed := io.Pipe()
+	type answer struct {
+		status int
+		err    error
+	}
+	answered := make(chan answer, 1)
+	go func() {
+		status, _, err := d.do(http.MethodPut, "/nar/"+p.narHash+".nar", body)
+		answered <- answer{status, err}
+	}()
+	half := len(p.archive) / 2
+	if _, err := feed.Write(p.archive[:half]); err != nil {
+		t.Fatal(err)
+	}
+	uploading(t, opts.CacheDir)
+
+	d.cancel()
+	// serve waits for it, and takes no new connection meanwhile.
+	time.Sleep(300 * time.Millisecond)
+	if !d.running() {
+		t.Fatalf("serve returned while a request was running:\n%s", d.log.String())
+	}
+	if _, _, err := d.do(http.MethodGet, "/nix-cache-info", nil); err == nil {
+		t.Errorf("serve took a new connection after the signal")
+	}
+	select {
+	case a := <-answered:
+		t.Fatalf("the upload was answered %d, %v before its body ended", a.status, a.err)
+	default:
+	}
+
+	if _, err := feed.Write(p.archive[half:]); err != nil {
+		t.Fatal(err)
+	}
+	feed.Close()
+	if a := <-answered; a.err != nil || a.status != http.StatusOK {
+		t.Errorf("the upload that ran when serve was stopped: status %d, %v, want 200\n%s", a.status, a.err, d.log.String())
+	}
+	if err := d.wait(10 * time.Second); err != nil {
+		t.Errorf("serve returned %v", err)
+	}
+}
+
+// A request that does not finish in the time serve gives it is cut.
+func TestServeCutsRequestsThatDoNotFinish(t *testing.T) {
+	clearEnvironment(t)
+	noNix(t)
+	srv := testserver.Start(t, testserver.Options{})
+	dir := t.TempDir()
+	opts := testOptions(t, dir)
+	d := startServe(t, opts, hostOf(srv, 200*time.Millisecond))
+	p := newTestPath(t, strings.Repeat("a request that never ends\n", 4000))
+
+	body, feed := io.Pipe()
+	defer feed.Close()
+	answered := make(chan error, 1)
+	go func() {
+		status, _, err := d.do(http.MethodPut, "/nar/"+p.narHash+".nar", body)
+		if err == nil && status == http.StatusOK {
+			err = errors.New("the upload was answered 200")
+		} else {
+			err = nil
+		}
+		answered <- err
+	}()
+	if _, err := feed.Write(p.archive[:len(p.archive)/2]); err != nil {
+		t.Fatal(err)
+	}
+	uploading(t, opts.CacheDir)
+
+	began := time.Now()
+	if err := d.stop(); err != nil {
+		t.Errorf("serve returned %v", err)
+	}
+	if took := time.Since(began); took < 200*time.Millisecond || took > 5*time.Second {
+		t.Errorf("serve took %v to stop with a request that does not end, want a little over 200ms", took)
+	}
+	if d.logged("requests that were still running have been cut") != 1 {
+		t.Errorf("serve does not say that it cut a request:\n%s", d.log.String())
+	}
+	// Go's client returns only once it has let go of the body it was
+	// sending.
+	feed.Close()
+	select {
+	case err := <-answered:
+		if err != nil {
+			t.Error(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Errorf("the request that was cut is still waiting")
+	}
+
+	// Nothing of it is left, and the directory is free.
+	cache, err := packcache.Open(opts.CacheDir, opts.CacheSize, packcache.Origin{Server: testServer, Prefix: opts.Prefix})
+	if err != nil {
+		t.Fatalf("the cache directory after serve returned: %v", err)
+	}
+	defer cache.Close()
+	if cache.Size() != 0 {
+		t.Errorf("the cache holds %d bytes after an upload that was cut", cache.Size())
+	}
+}
+
+func TestAdvertised(t *testing.T) {
+	bound := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4711}
+	for _, tc := range []struct{ listen, want string }{
+		{"127.0.0.1:8484", "127.0.0.1:8484"},
+		{"127.0.0.1:0", "127.0.0.1:4711"},
+		{":0", ":4711"},
+		{"[::1]:0", "[::1]:4711"},
+		{"localhost:00", "localhost:4711"},
+		{"0.0.0.0:8484", "0.0.0.0:8484"},
+	} {
+		if got := advertised(tc.listen, bound); got != tc.want {
+			t.Errorf("advertised(%q) = %q, want %q", tc.listen, got, tc.want)
 		}
 	}
 }
