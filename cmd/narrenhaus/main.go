@@ -32,19 +32,32 @@ import (
 var version = "dev"
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	// The first signal ends the context and the command winds down; from
-	// then on signals are the system's again, so a second one ends the
-	// process at once.
-	go func() {
-		<-ctx.Done()
-		stop()
-	}()
-	if err := newApp(os.Stdout, os.Stderr).RunContext(ctx, os.Args); err != nil {
+	if err := newApp(os.Stdout, os.Stderr).RunContext(untilSignalled(), os.Args); err != nil {
 		fmt.Fprintln(os.Stderr, "narrenhaus:", err)
 		os.Exit(1)
 	}
+}
+
+// untilSignalled returns a context that ends with the first SIGINT or
+// SIGTERM, on which the command winds down. A second signal ends the
+// process at once.
+//
+// The signals stay the command's for that. Given back to the system after
+// the first, they would be what the process was started with, and a shell
+// starts the background jobs of a script with SIGINT ignored: the second
+// signal would then do nothing.
+func untilSignalled() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-signals
+		cancel()
+		<-signals
+		fmt.Fprintln(os.Stderr, "narrenhaus: a second signal: stopped without waiting for the requests that run")
+		os.Exit(1)
+	}()
+	return ctx
 }
 
 // options is what the flags and the environment say, checked.

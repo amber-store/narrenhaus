@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -54,33 +55,52 @@ const (
 	idleTimeout       = 5 * time.Minute
 )
 
-// host is what serve takes from the machine besides its options. The
-// tests put a server in their own process in its place.
+// connectFunc returns the dial of the server for the client's key.
+type connectFunc func(key irohkey.SecretKey, server irohkey.EndpointID, log *slog.Logger) func(context.Context) (remote.Conn, error)
+
+// host is what serve takes from the machine besides its options, and the
+// times it keeps. The tests put a server in their own process in the
+// machine's place, and shorter times in the place of these.
 type host struct {
-	// connect returns the dial of the server for the client's key.
-	connect func(key irohkey.SecretKey, server irohkey.EndpointID, log *slog.Logger) func(context.Context) (remote.Conn, error)
+	connect connectFunc
+	// listen opens the address Nix talks to.
+	listen func(address string) (net.Listener, error)
 	// grace is how long requests that run when serve is told to stop get
 	// to finish.
 	grace time.Duration
+	// sweepEvery is how often staged uploads nobody came back for are
+	// looked for, and idleExpiry how long one may lie there before it is
+	// removed; zero is the uploader's own time, 15 minutes.
+	sweepEvery time.Duration
+	idleExpiry time.Duration
 }
 
 // thisHost is the machine as it is: the server is found by its endpoint
 // ID over iroh.
 func thisHost() host {
 	return host{
-		connect: func(key irohkey.SecretKey, server irohkey.EndpointID, log *slog.Logger) func(context.Context) (remote.Conn, error) {
-			cfg := node.DialConfig{Key: key, ALPN: wire.ALPN, Server: server, Log: log}
-			return func(ctx context.Context) (remote.Conn, error) {
-				conn, err := node.Dial(ctx, cfg)
-				if err != nil {
-					// Not conn: a nil *node.Conn in the interface is no
-					// nil.
-					return nil, err
-				}
-				return conn, nil
+		connect:    dialServer(),
+		listen:     func(address string) (net.Listener, error) { return net.Listen("tcp", address) },
+		grace:      shutdownGrace,
+		sweepEvery: sweepEvery,
+	}
+}
+
+// dialServer is the connect of the command: the server is dialled with the
+// client's key, for jaccard-store's protocol, by its endpoint ID. addrs is
+// for tests: the server is then dialled at these addresses and looked up
+// nowhere.
+func dialServer(addrs ...netip.AddrPort) connectFunc {
+	return func(key irohkey.SecretKey, server irohkey.EndpointID, log *slog.Logger) func(context.Context) (remote.Conn, error) {
+		cfg := node.DialConfig{Key: key, ALPN: wire.ALPN, Server: server, Addrs: addrs, Log: log}
+		return func(ctx context.Context) (remote.Conn, error) {
+			conn, err := node.Dial(ctx, cfg)
+			if err != nil {
+				// Not conn: a nil *node.Conn in the interface is no nil.
+				return nil, err
 			}
-		},
-		grace: shutdownGrace,
+			return conn, nil
+		}
 	}
 }
 
@@ -113,7 +133,7 @@ func serve(ctx context.Context, opts options, stderr io.Writer, h host) error {
 	// cache a second time does nothing.
 	defer cache.Close()
 
-	ln, err := net.Listen("tcp", opts.Listen)
+	ln, err := h.listen(opts.Listen)
 	if err != nil {
 		return fmt.Errorf("--listen %q: %w", opts.Listen, err)
 	}
@@ -135,10 +155,10 @@ func serve(ctx context.Context, opts options, stderr io.Writer, h host) error {
 	work, stopWork := context.WithCancel(context.Background())
 	rem := remote.New(remote.Config{Dial: h.connect(clientKey, opts.Server, log), Log: log})
 	store := refs.New(work, cache, rem, refs.Options{Prefix: opts.Prefix, Log: log})
-	up := upload.New(work, cache, rem, store, upload.Options{Log: log})
+	up := upload.New(work, cache, rem, store, upload.Options{IdleExpiry: h.idleExpiry, Log: log})
 	var sweeper sync.WaitGroup
 	sweeper.Go(func() {
-		tick := time.NewTicker(sweepEvery)
+		tick := time.NewTicker(h.sweepEvery)
 		defer tick.Stop()
 		for {
 			select {
@@ -166,12 +186,16 @@ func serve(ctx context.Context, opts options, stderr io.Writer, h host) error {
 	// the end stop waiting.
 	answering, cut := context.WithCancel(context.Background())
 	defer cut()
+	// The host of the option, which the options' check has seen to be
+	// there: when it is a name, Nix may call the cache by it.
+	name, _, _ := net.SplitHostPort(opts.Listen)
 	srv := &http.Server{
 		Handler: requests.wrap(httpd.New(httpd.Config{
 			Store:    store,
 			Uploader: up,
 			Key:      signing,
 			Priority: opts.Priority,
+			Host:     name,
 			Log:      log,
 		})),
 		BaseContext:       func(net.Listener) context.Context { return answering },
@@ -195,7 +219,9 @@ func serve(ctx context.Context, opts options, stderr io.Writer, h host) error {
 	}
 
 	// No new requests; the running ones get their time, then they are
-	// cut. Pushes that still run after that are abandoned.
+	// cut. Pushes that still run after that are abandoned. The uploader,
+	// the store and the cache are closed only once the requests have
+	// ended: a request stands on them.
 	grace, cancel := context.WithTimeout(context.Background(), h.grace)
 	defer cancel()
 	if srv.Shutdown(grace) != nil {
@@ -204,6 +230,11 @@ func serve(ctx context.Context, opts options, stderr io.Writer, h host) error {
 		if requests.wait(cutWait) {
 			log.Warn("requests that were still running have been cut")
 		} else {
+			// A request that outlives both its context and its connection
+			// is not waited for any longer. It finds the cache closed
+			// under it, which costs errors in the log of a process that
+			// is ending and nothing that is kept: what such a request
+			// leaves staged goes when the directory is next opened.
 			log.Warn("requests that were cut are still running")
 		}
 	}

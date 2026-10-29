@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -11,7 +12,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -22,7 +25,11 @@ import (
 	"time"
 
 	"github.com/amber-store/core/reference"
+	"github.com/amber-store/jaccard-store/bucket/buckettest"
+	"github.com/amber-store/jaccard-store/db"
 	"github.com/amber-store/jaccard-store/node"
+	"github.com/amber-store/jaccard-store/server"
+	"github.com/amber-store/jaccard-store/wire"
 	irohkey "github.com/tmc/go-iroh/key"
 	"github.com/urfave/cli/v2"
 
@@ -51,6 +58,9 @@ var optionVariables = []string{
 
 // clearEnvironment takes the options' variables out of the environment for
 // the test, so that what the developer's shell has set decides nothing.
+// The user's directories, which two options have their defaults under, it
+// puts under a directory of the test: where the test runs there may be no
+// home at all, and those defaults are then empty.
 func clearEnvironment(t *testing.T) {
 	t.Helper()
 	for _, name := range optionVariables {
@@ -59,6 +69,10 @@ func clearEnvironment(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, "cache"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
 }
 
 // load runs loadOptions on a command line of options alone.
@@ -849,6 +863,112 @@ func TestServeCreatesBothKeys(t *testing.T) {
 	}
 }
 
+// asCommand is the variable that makes the test binary the command: with
+// it set, the binary runs main on its arguments and no test.
+const asCommand = "NARRENHAUS_TEST_AS_COMMAND"
+
+func TestMain(m *testing.M) {
+	if os.Getenv(asCommand) != "" {
+		main()
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
+
+// The first signal lets the requests that run finish; a second one ends
+// the process at once, however it was started. A shell starts the
+// background jobs of a script with SIGINT ignored, and a process that
+// gives its signals back to the system after the first then ignores the
+// second.
+func TestSecondSignalEndsItAtOnce(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("no /bin/sh to start the command as a shell does")
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, script string
+	}{
+		{"in the foreground", `exec "$0" "$@"`},
+		{"in the background of a script", `trap '' INT; exec "$0" "$@"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			log := &syncBuffer{}
+			cmd := exec.Command("/bin/sh", append([]string{"-c", tc.script, self}, serveArgs(t.TempDir())...)...)
+			cmd.Env = []string{asCommand + "=1", "PATH="} // and so no nix
+			cmd.Stderr = log
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			exited := make(chan error, 1)
+			go func() { exited <- cmd.Wait() }()
+			running := true
+			t.Cleanup(func() {
+				if running {
+					cmd.Process.Kill()
+					<-exited
+				}
+			})
+			said := func(what string, re *regexp.Regexp) []string {
+				t.Helper()
+				for end := time.Now().Add(30 * time.Second); time.Now().Before(end); time.Sleep(2 * time.Millisecond) {
+					if m := re.FindStringSubmatch(log.String()); m != nil {
+						return m
+					}
+				}
+				t.Fatalf("the command never said %s:\n%s", what, log.String())
+				return nil
+			}
+			at, err := url.Parse(said("that it serves", servingLine)[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// A request that does not end: an upload whose body never
+			// comes. The handler has it once it asks for the body.
+			conn, err := net.Dial("tcp", at.Host)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			conn.SetDeadline(time.Now().Add(30 * time.Second))
+			fmt.Fprintf(conn, "PUT /%s.narinfo HTTP/1.1\r\nHost: %s\r\nContent-Length: 1000\r\nExpect: 100-continue\r\n\r\n",
+				strings.Repeat("0", 32), at.Host)
+			if line, err := bufio.NewReader(conn).ReadString('\n'); err != nil || !strings.Contains(line, "100 Continue") {
+				t.Fatalf("the upload was answered %q, %v before its body, want to be asked for the body", line, err)
+			}
+
+			if err := cmd.Process.Signal(os.Interrupt); err != nil {
+				t.Fatal(err)
+			}
+			said("that it is stopping", regexp.MustCompile(`msg="stopping: `))
+			select {
+			case err := <-exited:
+				running = false
+				t.Fatalf("the command ended with %v while a request was running:\n%s", err, log.String())
+			case <-time.After(200 * time.Millisecond):
+			}
+			if err := cmd.Process.Signal(os.Interrupt); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-exited:
+				running = false
+				if err == nil {
+					t.Errorf("the command ended as if nothing was wrong:\n%s", log.String())
+				}
+			case <-time.After(3 * time.Second):
+				t.Errorf("the command still runs three seconds after the second signal:\n%s", log.String())
+			}
+			if strings.Contains(log.String(), "msg=stopped") {
+				t.Errorf("the command waited for its requests after the second signal:\n%s", log.String())
+			}
+		})
+	}
+}
+
 // testPath is a small store path as Nix uploads it with ?compression=none.
 type testPath struct {
 	hash    string // of the store path
@@ -910,12 +1030,12 @@ func testOptions(t *testing.T, dir string) options {
 // hostOf is the machine of a test: the server is the one in this process,
 // whatever ID the options name, and requests get grace to finish.
 func hostOf(srv *testserver.Server, grace time.Duration) host {
-	return host{
-		connect: func(irohkey.SecretKey, irohkey.EndpointID, *slog.Logger) func(context.Context) (remote.Conn, error) {
-			return srv.Dial()
-		},
-		grace: grace,
+	h := thisHost()
+	h.connect = func(irohkey.SecretKey, irohkey.EndpointID, *slog.Logger) func(context.Context) (remote.Conn, error) {
+		return srv.Dial()
 	}
+	h.grace = grace
+	return h
 }
 
 // startServe runs serve itself, past the command line.
@@ -1149,6 +1269,11 @@ func TestServeCutsRequestsThatDoNotFinish(t *testing.T) {
 	if d.logged("requests that were still running have been cut") != 1 {
 		t.Errorf("serve does not say that it cut a request:\n%s", d.log.String())
 	}
+	// The request had ended when serve closed what it stood on, and had
+	// taken back what it staged.
+	if names := files(t, opts.CacheDir, "staging"); len(names) != 0 {
+		t.Errorf("staging holds %v when serve has returned: the upload that was cut had not ended", names)
+	}
 	// Go's client returns only once it has let go of the body it was
 	// sending.
 	feed.Close()
@@ -1169,6 +1294,366 @@ func TestServeCutsRequestsThatDoNotFinish(t *testing.T) {
 	defer cache.Close()
 	if cache.Size() != 0 {
 		t.Errorf("the cache holds %d bytes after an upload that was cut", cache.Size())
+	}
+}
+
+// eventually waits until cond holds.
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	for end := time.Now().Add(30 * time.Second); time.Now().Before(end); time.Sleep(2 * time.Millisecond) {
+		if cond() {
+			return
+		}
+	}
+	t.Fatalf("never happened: %s", what)
+}
+
+// files returns the names of what lies in the directory sub of a cache
+// directory.
+func files(t *testing.T, cache, sub string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(cache, sub))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+// called sends a request to the cache at base that calls it host, with
+// header as pairs of a name and a value, and reads the answer.
+func called(t *testing.T, base, host, method, target string, body []byte, header ...string) (status int, got []byte) {
+	t.Helper()
+	var in io.Reader
+	if body != nil {
+		in = bytes.NewReader(body)
+	}
+	req, err := http.NewRequest(method, base+target, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = host
+	for i := 0; i+1 < len(header); i += 2 {
+		req.Header.Set(header[i], header[i+1])
+	}
+	res, err := http.DefaultTransport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("%s %s as %s: %v", method, target, host, err)
+	}
+	defer res.Body.Close()
+	if got, err = io.ReadAll(res.Body); err != nil {
+		t.Fatalf("%s %s as %s: reading the answer: %v", method, target, host, err)
+	}
+	return res.StatusCode, got
+}
+
+// A page in a browser on the same machine reaches the port, under a name
+// of its own that it has pointed at 127.0.0.1. It is not Nix: nothing it
+// sends is taken, so nothing of it reaches the server, where a colleague's
+// narrenhaus would sign it; and nothing is served to it.
+func TestServeRefusesAWebPage(t *testing.T) {
+	clearEnvironment(t)
+	noNix(t)
+	srv := testserver.Start(t, testserver.Options{})
+	opts := testOptions(t, t.TempDir())
+	d := startServe(t, opts, hostOf(srv, time.Second))
+	planted := newTestPath(t, "#!/bin/sh\necho planted\n")
+	const page = "attacker.example:8484"
+
+	for _, put := range []struct {
+		target string
+		body   []byte
+	}{
+		{"/nar/" + planted.narHash + ".nar", planted.archive},
+		{"/" + planted.hash + ".narinfo", planted.narinfo},
+	} {
+		status, body := called(t, d.url, page, http.MethodPut, put.target, put.body, "Origin", "http://"+page)
+		if status != http.StatusForbidden || !strings.Contains(string(body), "attacker.example") {
+			t.Errorf("PUT %s of a web page: status %d (%q), want 403 and the name that was refused", put.target, status, body)
+		}
+	}
+	refs, err := srv.Client(t).List(context.Background(), "acme/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 0 {
+		t.Errorf("the server has %v after uploads of a web page", refs)
+	}
+	if names := files(t, opts.CacheDir, "staging"); len(names) != 0 {
+		t.Errorf("staging holds %v after uploads of a web page", names)
+	}
+
+	// What Nix uploaded is not there for the page either.
+	p := newTestPath(t, "hello, world\n")
+	d.want(http.StatusOK, http.MethodPut, "/nar/"+p.narHash+".nar", p.archive)
+	d.want(http.StatusOK, http.MethodPut, "/"+p.hash+".narinfo", p.narinfo)
+	for _, target := range []string{"/nix-cache-info", "/" + p.hash + ".narinfo", "/nar/" + p.narHash + ".nar"} {
+		if status, body := called(t, d.url, page, http.MethodGet, target, nil); status != http.StatusNotFound {
+			t.Errorf("GET %s of a web page: status %d (%q), want 404", target, status, body)
+		}
+	}
+	if d.logged("NAR served") != 0 {
+		t.Errorf("the log says a NAR was served to a web page:\n%s", d.log.String())
+	}
+	if got := d.want(http.StatusOK, http.MethodGet, "/nar/"+p.narHash+".nar", nil); !bytes.Equal(got, p.archive) {
+		t.Errorf("the NAR Nix gets is not the one sent")
+	}
+}
+
+// serve answers to the host of --listen when that is a name, besides the
+// addresses and localhost, and to no other name.
+func TestServeAnswersToTheNameItListensAt(t *testing.T) {
+	clearEnvironment(t)
+	noNix(t)
+	opts := testOptions(t, t.TempDir())
+	opts.Listen = "build.example:0"
+	h := thisHost()
+	h.grace = time.Second
+	// The name leads nowhere. The port is opened on loopback in its place.
+	h.listen = func(address string) (net.Listener, error) {
+		if address != opts.Listen {
+			return nil, fmt.Errorf("serve listens at %q, the option says %q", address, opts.Listen)
+		}
+		return net.Listen("tcp", "127.0.0.1:0")
+	}
+	d := startServe(t, opts, h)
+	at, err := url.Parse(d.url)
+	if err != nil || at.Hostname() != "build.example" {
+		t.Fatalf("serve says it serves at %s, want the name of --listen with the port it got (%v)", d.url, err)
+	}
+	base := "http://127.0.0.1:" + at.Port()
+	for _, tc := range []struct {
+		host   string
+		status int
+	}{
+		{"build.example:" + at.Port(), http.StatusOK},
+		{"Build.Example", http.StatusOK},
+		{"127.0.0.1:" + at.Port(), http.StatusOK},
+		{"localhost:" + at.Port(), http.StatusOK},
+		{"other.example:" + at.Port(), http.StatusNotFound},
+		{"build.example.attacker.example:" + at.Port(), http.StatusNotFound},
+	} {
+		if status, body := called(t, base, tc.host, http.MethodGet, "/nix-cache-info", nil); status != tc.status {
+			t.Errorf("GET /nix-cache-info of a client that calls the cache %s: status %d (%q), want %d", tc.host, status, body, tc.status)
+		}
+	}
+}
+
+// failingBucket makes every upload to the server's bucket fail in a way
+// that may pass, and returns how many files lay under the staging
+// directory of cache when the first one failed.
+func failingBucket(t *testing.T, srv *testserver.Server, cache string) (staged func() int) {
+	t.Helper()
+	var (
+		mu   sync.Mutex
+		seen = -1
+	)
+	srv.Intercept(func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method != http.MethodPut {
+			return false
+		}
+		mu.Lock()
+		if seen < 0 {
+			entries, _ := os.ReadDir(filepath.Join(cache, "staging"))
+			seen = len(entries)
+		}
+		mu.Unlock()
+		http.Error(w, "the bucket is not well", http.StatusInternalServerError)
+		return true
+	})
+	return func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return seen
+	}
+}
+
+// A NAR whose push failed for now stays staged for the upload that comes
+// back for it, and not for ever: serve looks for such NARs on a timer and
+// removes them once nothing has asked for the idle time.
+func TestServeRemovesStagedNARsNobodyCameBackFor(t *testing.T) {
+	clearEnvironment(t)
+	noNix(t)
+	srv := testserver.Start(t, testserver.Options{})
+	opts := testOptions(t, t.TempDir())
+	staged := failingBucket(t, srv, opts.CacheDir)
+	h := hostOf(srv, time.Second)
+	h.sweepEvery, h.idleExpiry = 10*time.Millisecond, 300*time.Millisecond
+	d := startServe(t, opts, h)
+	p := newTestPath(t, "a NAR whose narinfo never comes\n")
+
+	d.want(http.StatusOK, http.MethodPut, "/nar/"+p.narHash+".nar", p.archive)
+	eventually(t, "the push has failed for now", func() bool {
+		return d.logged("a content push failed for now; its NAR stays staged") == 1
+	})
+	if staged() <= 0 {
+		t.Fatalf("%d files were staged while the NAR was pushed, want some", staged())
+	}
+	eventually(t, "the staged NAR is removed", func() bool {
+		return len(files(t, opts.CacheDir, "staging")) == 0
+	})
+	if d.logged("staged NARs whose pushes had failed were deleted: no upload came back for them") != 1 {
+		t.Errorf("the log does not say that the staged NAR was deleted:\n%s", d.log.String())
+	}
+}
+
+// The size of --cache-size is the cache's: with one below any pack,
+// nothing stays in the cache once no request holds it.
+func TestServeKeepsTheCacheUnderItsSize(t *testing.T) {
+	clearEnvironment(t)
+	noNix(t)
+	srv := testserver.Start(t, testserver.Options{})
+	opts := testOptions(t, t.TempDir())
+	opts.CacheSize = 1
+	d := startServe(t, opts, hostOf(srv, time.Second))
+	p := newTestPath(t, strings.Repeat("more than one byte\n", 1000))
+
+	d.want(http.StatusOK, http.MethodPut, "/nar/"+p.narHash+".nar", p.archive)
+	d.want(http.StatusOK, http.MethodPut, "/"+p.hash+".narinfo", p.narinfo)
+	d.want(http.StatusOK, http.MethodGet, "/"+p.hash+".narinfo", nil)
+	if got := d.want(http.StatusOK, http.MethodGet, "/nar/"+p.narHash+".nar", nil); !bytes.Equal(got, p.archive) {
+		t.Errorf("the NAR that came back is not the one sent")
+	}
+	// A request lets go of its packs after its answer has gone out.
+	eventually(t, "the cache holds no pack", func() bool {
+		return len(files(t, opts.CacheDir, "packs")) == 0
+	})
+}
+
+// A narinfo that comes after a restart finds no NAR: what was staged is
+// gone with the process that staged it, and the answer says that the NAR
+// has to be sent again.
+func TestNarinfoAfterARestart(t *testing.T) {
+	clearEnvironment(t)
+	noNix(t)
+	srv := testserver.Start(t, testserver.Options{})
+	opts := testOptions(t, t.TempDir())
+	staged := failingBucket(t, srv, opts.CacheDir)
+	d := startServe(t, opts, hostOf(srv, time.Second))
+	p := newTestPath(t, "a NAR that is staged when narrenhaus stops\n")
+
+	d.want(http.StatusOK, http.MethodPut, "/nar/"+p.narHash+".nar", p.archive)
+	eventually(t, "the push has failed for now", func() bool {
+		return d.logged("a content push failed for now; its NAR stays staged") == 1
+	})
+	if staged() <= 0 || len(files(t, opts.CacheDir, "staging")) == 0 {
+		t.Fatalf("no NAR is staged before the restart: %d files while it was pushed, %v now",
+			staged(), files(t, opts.CacheDir, "staging"))
+	}
+	if err := d.stop(); err != nil {
+		t.Fatalf("serve returned %v when it was stopped", err)
+	}
+
+	// The bucket is well again, and it is too late for that NAR.
+	srv.Intercept(nil)
+	d = startServe(t, opts, hostOf(srv, time.Second))
+	if names := files(t, opts.CacheDir, "staging"); len(names) != 0 {
+		t.Errorf("staging holds %v after a restart", names)
+	}
+	got := string(d.want(http.StatusBadRequest, http.MethodPut, "/"+p.hash+".narinfo", p.narinfo))
+	if !strings.Contains(got, p.narHash) || !strings.Contains(got, "no NAR") {
+		t.Errorf("the 400 says %q, want it to name the NAR that was not received", got)
+	}
+	d.want(http.StatusNotFound, http.MethodHead, "/nar/"+p.narHash+".nar", nil)
+
+	// Sent again, as Nix does when its copy is repeated, the path is taken.
+	d.want(http.StatusOK, http.MethodPut, "/nar/"+p.narHash+".nar", p.archive)
+	d.want(http.StatusOK, http.MethodPut, "/"+p.hash+".narinfo", p.narinfo)
+}
+
+// The dial of the command itself, which every other test replaces: the
+// server of --server is dialled, for jaccard-store's protocol, as the
+// client whose key lies in the configuration directory.
+//
+// The server here is the test's own and not testserver's, because the
+// command's dial needs its endpoint ID and address, and the test the
+// server's record of who wrote a reference.
+func TestServeDialsTheServerOfItsOptions(t *testing.T) {
+	clearEnvironment(t)
+	noNix(t)
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dir := t.TempDir()
+	database, err := db.Open(filepath.Join(dir, "store.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	js, err := server.New(server.Config{DB: database, Bucket: buckettest.New(t), Scratch: filepath.Join(dir, "scratch"), Log: quiet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverKey, err := node.LoadOrCreateKey(filepath.Join(dir, "server.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, stop := context.WithCancel(context.Background())
+	ep, err := node.Bind(ctx, node.ServerConfig{Key: serverKey, ALPN: wire.ALPN, Local: true, Log: quiet})
+	if err != nil {
+		stop()
+		t.Fatal(err)
+	}
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		js.Serve(ctx, ep)
+	}()
+	t.Cleanup(func() {
+		stop()
+		<-served
+		ep.Shutdown(context.Background())
+	})
+
+	opts := testOptions(t, t.TempDir())
+	opts.Server = serverKey.Public().EndpointID()
+	h := thisHost()
+	h.connect = dialServer(ep.LocalAddr())
+	h.grace = time.Second
+	d := startServe(t, opts, h)
+	p := newTestPath(t, "over the dial of the command\n")
+	d.want(http.StatusOK, http.MethodPut, "/nar/"+p.narHash+".nar", p.archive)
+	d.want(http.StatusOK, http.MethodPut, "/"+p.hash+".narinfo", p.narinfo)
+
+	// The server knows who wrote the references: the key that serve made.
+	client, err := node.LoadOrCreateKey(filepath.Join(opts.ConfigDir, "client.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"acme/" + p.hash + ".narinfo", "acme/nar/" + p.narHash + ".nar"} {
+		ref, err := database.Ref(context.Background(), name)
+		if err != nil {
+			t.Fatalf("the server's reference %s: %v", name, err)
+		}
+		if want := client.Public().EndpointID().String(); ref.UpdatedBy != want {
+			t.Errorf("the server has %s as written by %s, want the client key of the configuration directory, %s", name, ref.UpdatedBy, want)
+		}
+	}
+	if err := d.stop(); err != nil {
+		t.Errorf("serve returned %v when it was stopped", err)
+	}
+
+	// With another ID in --server nobody answers at the same address: the
+	// server there is not the one that was asked for.
+	other := testOptions(t, t.TempDir())
+	d = startServe(t, other, h)
+	d.want(http.StatusBadGateway, http.MethodPut, "/nar/"+p.narHash+".nar", p.archive)
+}
+
+// thisHost keeps the times the design names: ten seconds for requests that
+// run when serve is told to stop, a look at the staged uploads every
+// minute, and the uploader's own idle time.
+func TestThisHostKeepsTheTimesOfTheDesign(t *testing.T) {
+	h := thisHost()
+	if h.grace != 10*time.Second {
+		t.Errorf("running requests get %v to finish, want 10s", h.grace)
+	}
+	if h.sweepEvery != time.Minute {
+		t.Errorf("staged uploads are looked at every %v, want every minute", h.sweepEvery)
+	}
+	if h.idleExpiry != 0 {
+		t.Errorf("the idle time is %v, want it left to the uploader", h.idleExpiry)
 	}
 }
 
