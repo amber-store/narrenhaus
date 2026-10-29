@@ -85,6 +85,13 @@ and `~/Library/Caches` on macOS; the configuration directory is `~/.config`
 - With a `--listen` address that is not loopback, anyone who can reach the
   port can upload into the shared prefix and get narinfos signed with this
   machine's key. The advice warns about it.
+- narrenhaus answers Nix and not a page in a web browser, which can reach a
+  port on loopback too. A request is answered only when it calls the cache
+  by an IP address, by `localhost` or by the host of `--listen`, and an
+  upload only when it carries no `Origin`, which a browser always sends
+  with one. So the substituter URL names the cache by its address, as the
+  advice prints it, or by the name `--listen` was given; under any other
+  name an upload is refused (403) and nothing is found (404).
 
 ## Setup
 
@@ -233,9 +240,13 @@ What it does not do
 ## Development
 
 The repository is a flake; `nix build` makes the command with
-[gonixgo](https://github.com/draganm/gonixgo) and runs the packages' tests
-in the build. Evaluating a gonixgo package runs a program during
-evaluation, so every Nix command that touches the package needs one option:
+[gonixgo](https://github.com/draganm/gonixgo) and runs, in the build, the
+tests of the packages the command is made of. It does not run the tests of
+`e2e`: that package is test files alone, the command does not contain it,
+and gonixgo tests what the command contains. `go test ./e2e/` in the dev
+shell runs them, as `go test ./...` does. Evaluating a gonixgo package runs
+a program during evaluation, so every Nix command that touches the package
+needs one option:
 
 ```sh
 nix build --option allow-unsafe-native-code-during-evaluation true
@@ -252,13 +263,17 @@ nix develop --option allow-unsafe-native-code-during-evaluation true
   `go.sum` behind.
 - `go test ./...` runs everything. Most tests start a jaccard-store server
   in their own process, over iroh on loopback with a bucket in memory, and
-  need no network beyond loopback. `NARRENHAUS_TEST_LOG=1` prints what the
-  narrenhaus instances of a test logged.
+  need no network beyond loopback. A test that fails prints what its
+  narrenhaus instances logged; `NARRENHAUS_TEST_LOG=1 go test -v ./...`
+  prints it for every test.
 - The tests in `e2e/nix_test.go` run the real `nix` against two narrenhaus
-  instances and skip where there is no `nix` on `PATH` (as in the build
-  sandbox). They add small generated paths, one of 17 MiB, to the machine's
-  Nix store with `nix store add` and delete them again where the store
-  allows it; they change no Nix configuration.
+  instances and skip where there is no `nix` on `PATH`. They add small
+  generated paths, one of 17 MiB, to the machine's Nix store with
+  `nix store add` and delete them again where the store allows it; they
+  change no Nix configuration. One of them shows what `fallback = true` is
+  for: it builds three derivations of one line with a stopped narrenhaus as
+  the substituter, through the machine's Nix daemon, and skips where the
+  daemon does not trust the user and so does not ask that substituter.
 - jaccard-store is required at a released version only.
 
 Packages, all at the top level:

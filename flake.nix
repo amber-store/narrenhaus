@@ -29,8 +29,10 @@
           goEnv = gonixgo.lib.mkGoEnv { inherit pkgs; };
         in {
           # The command, narrenhaus. The build also runs the tests of the
-          # packages it is made of; those that need the nix program, a
-          # network or a container skip themselves in the sandbox.
+          # packages it is made of; those that need the nix program skip
+          # themselves in the sandbox. It does not run the tests of e2e:
+          # gonixgo tests the packages the command contains, and e2e is
+          # test files alone. `go test ./e2e/` in the dev shell runs them.
           default = goEnv.buildGoApplication {
             pname = "narrenhaus";
             src = ./.;
