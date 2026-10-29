@@ -50,20 +50,21 @@ Work in `/Users/dragan/amber-store/jaccard-store` on a new branch `client-object
 **Interfaces:**
 - Produces:
   ```go
-  // Objects is where a push reads objects from. *packstore.Store is one.
+  // ObjectSource is where a push reads objects from. *packstore.Store is
+  // one. (Not "Objects": client.Objects is already the progress unit.)
   // Get must be safe for concurrent calls and return a slice the caller owns.
-  type Objects interface {
+  type ObjectSource interface {
       Get(k key.Key) ([]byte, error)
   }
 
   // PushFrom is Push for any source of objects.
-  func (c *Client) PushFrom(ctx context.Context, objects Objects, name string, root key.Key, opts PushOptions) (PushResult, error)
+  func (c *Client) PushFrom(ctx context.Context, objects ObjectSource, name string, root key.Key, opts PushOptions) (PushResult, error)
   ```
   `Push(ctx, objects *packstore.Store, …)` keeps its signature and calls `PushFrom`. A source that also has `SortByLocation(keys []key.Key)` (unexported interface `sorter` in `objects.go`) has it applied to the pack's own keys before packing, exactly where `build` calls it today; other sources are packed in key-set order.
 
 - [ ] **Step 1: Failing tests.** In `client/push_test.go`: `TestBuildOrdersByLocationWhenTheSourceCan` (a fake source recording `SortByLocation` calls: called once with the pack's own keys) and `TestBuildKeepsKeySetOrderOtherwise` (a map-backed source: objects are written in `keys` order). In `e2e/objects_test.go` (same harness as `e2e_test.go`): `TestPushFromAMapEqualsPushFromAPackstore` (push one directory tree twice under two names, once with `Push` from a packstore and once with `PushFrom` from a `map[key.Key][]byte`; both report the same `Root`, the second reports `Stored`), and `TestPushFromASingleBlobRoot` (root = one Blob of 300 bytes; `PushResult.Objects == 1`; a `Pull` of the name into a fresh packstore returns that root and `Packs == 1`), run both verifying and with `--no-verify` as `noverify_test.go` does.
 - [ ] **Step 2: Run** `go test ./client/ -run 'TestBuild' ./e2e/ -run 'TestPushFrom'` — expect compile failures for `PushFrom`.
-- [ ] **Step 3: Implement.** Change the `objects *packstore.Store` parameter of `keySet`, `push` and `build` to `Objects`; in `build` replace `objects.SortByLocation(own)` with a type assertion on `sorter`. Add `PushFrom` (the body of today's `Push`) and make `Push` call it. Update the package comment to say a push reads from any `Objects`.
+- [ ] **Step 3: Implement.** Change the `objects *packstore.Store` parameter of `keySet`, `push` and `build` to `ObjectSource`; in `build` replace `objects.SortByLocation(own)` with a type assertion on `sorter`. Add `PushFrom` (the body of today's `Push`) and make `Push` call it. Update the package comment to say a push reads from any `Objects`.
 - [ ] **Step 4: Run** `gofmt -l . ; go vet ./... ; go test ./client/... ./e2e/...` — all pass, including every pre-existing test.
 - [ ] **Step 5: Commit** `client: push from any source of objects`.
 
@@ -121,7 +122,7 @@ Work in `/Users/dragan/amber-store/jaccard-store` on a new branch `client-object
 ### Task A3: Document, pull request, merge, release v0.8.0
 
 **Files:**
-- Modify: `README.md` (a short "Using the client from Go" section naming `PushFrom`, `Objects`, `Lookup`, `Fetch`, `Pack`)
+- Modify: `README.md` (a short "Using the client from Go" section naming `PushFrom`, `ObjectSource`, `Lookup`, `Fetch`, `Pack`)
 
 - [ ] **Step 1:** Add the README section; commit `README: the client's Go API for other object stores`.
 - [ ] **Step 2:** `git push -u origin client-objects-and-fetch`; `gh pr create` with a body describing the two additions and that no command or server behaviour changes.
@@ -453,7 +454,7 @@ Work in `/Users/dragan/amber-store/narrenhaus`. Part B starts only after `v0.8.0
 - Create: `testserver/testserver.go`, `remote/remote.go`, `remote/remote_test.go`
 
 **Interfaces:**
-- Consumes: jaccard-store `client.New`, `client.Opener`, `client.Lookup`, `client.Fetch`, `client.PushFrom`, `client.Objects`, `client.Pack`, `node.Dial`, `node.DialConfig`, `wire.ALPN`, `wire.Error`, `wire.CodeBadRequest`, `wire.CodeMalformedPack` (check the exact constant names in `wire/wire.go`); for `testserver`: jaccard-store `server`, `db`, `node`, `bucket/buckettest`, following `/Users/dragan/amber-store/jaccard-nfs-nix-store/jstest/jstest.go` (copy the pattern; do not import that module).
+- Consumes: jaccard-store `client.New`, `client.Opener`, `client.Lookup`, `client.Fetch`, `client.PushFrom`, `client.ObjectSource`, `client.Pack`, `node.Dial`, `node.DialConfig`, `wire.ALPN`, `wire.Error`, `wire.CodeBadRequest`, `wire.CodeMalformedPack` (check the exact constant names in `wire/wire.go`); for `testserver`: jaccard-store `server`, `db`, `node`, `bucket/buckettest`, following `/Users/dragan/amber-store/jaccard-nfs-nix-store/jstest/jstest.go` (copy the pattern; do not import that module).
 - Produces:
   ```go
   package testserver
@@ -518,7 +519,7 @@ Work in `/Users/dragan/amber-store/narrenhaus`. Part B starts only after `v0.8.0
   func (r *Remote) Fetch(ctx context.Context, p client.Pack, each func(packfile.Object) error) (*packfile.Index, error)
 
   // Push is client.PushFrom; it has no time limit of its own.
-  func (r *Remote) Push(ctx context.Context, objects client.Objects, name string, root key.Key, opts client.PushOptions) (client.PushResult, error)
+  func (r *Remote) Push(ctx context.Context, objects client.ObjectSource, name string, root key.Key, opts client.PushOptions) (client.PushResult, error)
 
   // ForGood reports whether a push failed for a reason a repeat cannot
   // cure: the server answered bad_request or malformed_pack.
