@@ -273,7 +273,7 @@ tests of the packages the command is made of. It does not run the tests of
 `e2e`: that package is test files alone, the command does not contain it,
 and gonixgo tests what the command contains. `go test ./e2e/` in the dev
 shell runs them, as `go test ./...` does; of the cases with two instances
-the build runs the one in `cmd/narrenhaus`, an upload to one `serve` that
+the build runs those in `cmd/narrenhaus`, uploads to one `serve` that
 another serves. Evaluating a gonixgo package runs
 a program during evaluation, so every Nix command that touches the package
 needs one option:
@@ -307,10 +307,12 @@ nix develop --option allow-unsafe-native-code-during-evaluation true
   fallback and a third succeeds with it. The builds go through the
   machine's Nix daemon, and the test skips where the daemon does not trust
   the user and so does not ask that substituter.
-- Two tests in other packages ask the `nix` on `PATH` and add nothing to
-  the store: one in `narinfo` asks which content addresses Nix reads, from
-  a cache of files in a temporary directory, and skips on a Nix before
-  2.31; one in `nixconf` asks which configuration it reads.
+- Tests in three other packages ask the Nix on `PATH` and add nothing to
+  the store: two in `narinfo` (which content addresses Nix reads, from a
+  cache of files in a temporary directory, skipped on a Nix before 2.31;
+  and that Nix takes a narinfo's signature as the key's), one in `nixconf`
+  (which configuration it reads) and one in `nar` (`nix-store --dump`
+  against the package's own writer).
 - jaccard-store is required at a released version only.
 
 Packages, all at the top level:

@@ -14,7 +14,7 @@
 
 ## Global Constraints
 
-- Repositories: Part A in `/Users/dragan/amber-store/jaccard-store` (branch `client-objects-and-fetch`), Part B in `/Users/dragan/amber-store/narrenhaus` (branch `main`, local only, no remote).
+- Repositories: Part A in `../jaccard-store` (branch `client-objects-and-fetch`), Part B in `../narrenhaus` (branch `main`, local only, no remote).
 - narrenhaus `go.mod`: `module github.com/amber-store/narrenhaus`, `go 1.26.3`; jaccard-store is required at the released tag `v0.8.0` only. No pseudo-version, no `replace`, ever.
 - Flat top-level packages. No `internal/` directory.
 - CLI on `github.com/urfave/cli/v2`; every option has a flag and a `NARRENHAUS_…` environment variable.
@@ -40,7 +40,7 @@ Conditions the spec implies but does not test; each has a test in the task that 
 
 # Part A: jaccard-store v0.8.0
 
-Work in `/Users/dragan/amber-store/jaccard-store` on a new branch `client-objects-and-fetch` from `main`. Existing behaviour and tests must not change. Run `gofmt -l .`, `go vet ./...` and `go test ./client/... ./packfile/... ./e2e/...` before each commit (the e2e container tests skip without Docker).
+Work in `../jaccard-store` on a new branch `client-objects-and-fetch` from `main`. Existing behaviour and tests must not change. Run `gofmt -l .`, `go vet ./...` and `go test ./client/... ./packfile/... ./e2e/...` before each commit (the e2e container tests skip without Docker).
 
 ### Task A1: Push from any object source
 
@@ -136,7 +136,7 @@ Work in `/Users/dragan/amber-store/jaccard-store` on a new branch `client-object
 
 # Part B: narrenhaus
 
-Work in `/Users/dragan/amber-store/narrenhaus`. Part B starts only after `v0.8.0` of jaccard-store resolves through the Go module proxy.
+Work in `../narrenhaus`. Part B starts only after `v0.8.0` of jaccard-store resolves through the Go module proxy.
 
 **File map**
 
@@ -298,7 +298,7 @@ Work in `/Users/dragan/amber-store/narrenhaus`. Part B starts only after `v0.8.0
   // length.
   func WriteNAR(w io.Writer, node Node, get Getter) error
   ```
-  Entry fields per spec 4.2. `Root`'s directory is built with `fstree.NewDirBuilder(chunkers.NewItemChunker(ingest.DefaultItemBits))`; so is every directory inside the NAR. `File` follows `core/ingest/driver.go` `buildFile` (read it first: `/Users/dragan/go/pkg/mod/github.com/amber-store/core@v0.10.0/ingest/driver.go`), including the empty-file case.
+  Entry fields per spec 4.2. `Root`'s directory is built with `fstree.NewDirBuilder(chunkers.NewItemChunker(ingest.DefaultItemBits))`; so is every directory inside the NAR. `File` follows `core/ingest/driver.go` `buildFile` (read it first: `$GOMODCACHE/github.com/amber-store/core@v0.10.0/ingest/driver.go`), including the empty-file case.
 
 - [ ] **Step 1: Failing tests.** `TestRoundTrip` — for each archive of Task B2's round-trip table: `Ingest` into a `map[key.Key][]byte`, `Root`, then `Open` and `WriteNAR` reproduce the input bytes; `NarHash`/`NarSize` equal `sha256`/`len` of the input; every key of the map is reachable from the root (`fstree.ReachableKeys`) and nothing else is in the map. `TestMultiChunkFile` (an 8 MiB file of seeded pseudo-random bytes round-trips and its content key's type is `key.FileNode`). `TestRecipeBytes` — `Recipe(sha256(""), 120)` equals exactly `{"format":"narrenhaus-recipe","narHash":"sha256:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73","narSize":120,"node":"nar","version":1}`. `TestOpenUnknownRecipeVersion` (`version` 2 → `ErrUnknownRecipe`), `TestOpenNotAWrapper` (a plain directory root, a Blob root, a wrapper with a third entry → `ErrBroken`). `TestModesAsCoreReadsThem` — decode the wrapper and the tree with `fstree.CollectEntries`: modes are exactly `0o100444`, `0o100555`, `0o040555`, `0o120777`; UID and GID 0; Mtime `1_000_000_000`. `TestIngestIsStreaming` — ingest a 64 MiB file root from a generated reader with an `emit` that discards: `testing.AllocsPerRun`-style measurement of `runtime.MemStats.TotalAlloc` shows peak heap (`HeapInuse` sampled in `emit`) under 16 MiB. `TestSameNARSameRoot` (two ingests give one root key). In `frozen_test.go`: `TestFrozenKeys` — the fixed small archive (directory with `file` = `"plain\n"`, executable `run` = `"#!/bin/sh\n"`, subdirectory `sub` holding `inner` = `"x"`, symlink `link` → `file`) gives a hard-coded root key, and the 8 MiB seeded file a hard-coded content key.
 - [ ] **Step 2: Run** `go test ./nartree/` — compile failure.
@@ -469,7 +469,7 @@ Work in `/Users/dragan/amber-store/narrenhaus`. Part B starts only after `v0.8.0
 - Create: `testserver/testserver.go`, `remote/remote.go`, `remote/remote_test.go`
 
 **Interfaces:**
-- Consumes: jaccard-store `client.New`, `client.Opener`, `client.Lookup`, `client.Fetch`, `client.PushFrom`, `client.ObjectSource`, `client.Pack`, `node.Dial`, `node.DialConfig`, `wire.ALPN`, `wire.Error`, `wire.CodeBadRequest`, `wire.CodeMalformedPack` (check the exact constant names in `wire/wire.go`); for `testserver`: jaccard-store `server`, `db`, `node`, `bucket/buckettest`, following `/Users/dragan/amber-store/jaccard-nfs-nix-store/jstest/jstest.go` (copy the pattern; do not import that module).
+- Consumes: jaccard-store `client.New`, `client.Opener`, `client.Lookup`, `client.Fetch`, `client.PushFrom`, `client.ObjectSource`, `client.Pack`, `node.Dial`, `node.DialConfig`, `wire.ALPN`, `wire.Error`, `wire.CodeBadRequest`, `wire.CodeMalformedPack` (check the exact constant names in `wire/wire.go`); for `testserver`: jaccard-store `server`, `db`, `node`, `bucket/buckettest`, following `../jaccard-nfs-nix-store/jstest/jstest.go` (copy the pattern; do not import that module).
 - Produces:
   ```go
   package testserver

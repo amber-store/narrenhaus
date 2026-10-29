@@ -1469,7 +1469,7 @@ func TestServeClosesNothingUnderARequestThatStillRuns(t *testing.T) {
 	if err := d.stop(); err != nil {
 		t.Errorf("serve returned %v", err)
 	}
-	if took := time.Since(began); took < 400*time.Millisecond || took > 10*time.Second {
+	if took := time.Since(began); took < 400*time.Millisecond || took > 3*time.Second {
 		t.Errorf("serve took %v to stop, want the 100ms it gives requests and the 300ms it waits for those it cut", took)
 	}
 	if d.logged("requests that were cut are still running; nothing is closed under them") != 1 || d.logged("requests that were still running have been cut") != 0 {
