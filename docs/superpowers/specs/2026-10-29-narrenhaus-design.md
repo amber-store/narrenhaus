@@ -1,9 +1,9 @@
 # narrenhaus: design
 
-Date: 2026-10-29. Status: revised after the owner split the reference in
-two; waiting for the owner's approval. Checked against jaccard-store
-v0.7.0, Amber-Store Core v0.10.0 and Nix 2.26.1 and 2.35.4 (the owner's
-machine runs 2.35.4).
+Date: 2026-10-29. Status: complete, waiting for the owner's approval.
+Reviewed twice against jaccard-store v0.7.0, Amber-Store Core v0.10.0 and
+the source of Nix 2.26.1 and 2.35.4 (the owner's machine runs 2.35.4).
+Nothing in it has been run against a live cache.
 
 ## 1. Purpose
 
@@ -75,11 +75,13 @@ add and where.
 
 ### 2.2 Made in design, accepted by the owner in conversation
 
-These were proposed as guesses and the owner answered "nothing wrong".
-Three guesses of that round (one wrapper reference holding the narinfo,
-its name, and a narinfo request downloading its packs) fell with the
-owner's split into two references and are not listed.
+These were proposed and the owner answered "nothing wrong" or "fine".
+Three guesses of the first round (one wrapper reference holding the
+narinfo, its name, and a narinfo request downloading its packs) fell with
+the owner's split into two references and are not listed.
 
+- **The content reference is named by the NAR's hash**, not the store
+  path's (section 4.1).
 - **Trust inside Nix's rules.** Each laptop's narrenhaus signs the narinfos
   it serves with its own local key, and the suggested configuration adds
   that key to the trusted keys. Nix's signature checking stays on for every
@@ -134,32 +136,32 @@ Each is the designer's call and may be overruled.
 1. **Names of the two references.** The prefix followed by the path Nix
    asks for: `<prefix><store hash>.narinfo` and
    `<prefix>nar/<NAR hash>.nar` (section 4.1).
-2. **The content reference is named by the NAR's hash, not the store
-   path's.** Its name then says what it holds: it cannot come to hold
-   another build, identical contents are stored once, and it can be pushed
-   before any narinfo exists.
-3. **A NAR is pushed as soon as it has been received**, without waiting
+2. **A NAR is pushed as soon as it has been received**, without waiting
    for its narinfo (section 5.1). With Nix 2.35, which sends every NAR of
    a copy before the first narinfo, staging then drains as pushes finish.
-4. The content reference's root is a wrapper directory holding the store
+3. The content reference's root is a wrapper directory holding the store
    path's tree and the recipe; the narinfo reference's root is the narinfo
    text itself, one small object (section 4).
-5. The metadata convention of section 4.2, with values chosen to equal
+4. The metadata convention of section 4.2, with values chosen to equal
    what a Linux multi-user `/nix/store` shows, so that directory objects
    can be shared with references pushed by `jaccard-store push-dir`.
-6. The recipe is a small JSON object with a version, the NAR's hash and
+5. The recipe is a small JSON object with a version, the NAR's hash and
    its size (section 4.3).
-7. The NAR URL in served narinfos is `nar/<NAR hash>.nar`: the same URL
+6. The NAR URL in served narinfos is `nar/<NAR hash>.nar`: the same URL
    Nix itself uploads to with `?compression=none`.
-8. A narinfo `PUT` answers only when both references are on the server,
-   so a successful `nix copy` means the path can be substituted. The work
-   belongs to narrenhaus, not to the request: it goes on if Nix gives up
-   waiting, and a repeated `PUT` joins it (section 5.3).
-9. First writer wins for both references: one that already exists is not
-   pushed again, unless this laptop found it broken (section 5).
-10. `HEAD` on `nar/<NAR hash>.nar` answers truthfully, so with
-    `?compression=none` Nix skips NARs the server already has. `HEAD` on a
-    compressed upload URL always answers 404 (section 5.1).
+7. A narinfo `PUT` answers only when both references are on the server,
+   so a successful `nix copy` means the path could be substituted at that
+   moment. The work belongs to narrenhaus, not to the request: it goes on
+   if Nix gives up waiting, and a repeated `PUT` joins it (section 5.3).
+8. **First writer wins** for both references: one that already exists is
+   never pushed again. **narrenhaus does not repair** a reference it finds
+   broken; it answers 404 for it and logs it, and the cure is to delete the
+   reference by hand and upload again (sections 6.4, 12).
+9. `HEAD` on `nar/<NAR hash>.nar` answers truthfully, so with
+   `?compression=none` Nix skips NARs the server already has. `HEAD` on a
+   compressed upload URL always answers 404 (section 5.1).
+10. Uploads fail fast when the server cannot be reached: a NAR `PUT` is
+    refused with 502 before its body is read (section 5.1).
 11. Upload compressions accepted: none, xz, zstd, gzip, bzip2. Others are
     refused with 415 (section 5.1).
 12. `PUT` of anything but a NAR or a narinfo is refused with 405; `GET` of
@@ -173,19 +175,21 @@ Each is the designer's call and may be overruled.
     while the download goes on, so narrenhaus answers before Nix's own
     300-second limit (section 6.4).
 15. Defaults: listen `127.0.0.1:8484`, cache size 10 GiB, priority 50,
-    parent rule as jaccard-store's CLI (at least half the bytes shared),
-    four pushes and eight pack downloads at once.
+    parent rule as jaccard-store's CLI (at least half the bytes shared);
+    at once, four content pushes, eight narinfo pushes, eight content
+    downloads and sixteen narinfo downloads.
 16. The signing key's name is `narrenhaus-<first 8 hex digits of its public
     key>`. Nix keeps one key per name, so one name for every laptop would
     break as soon as two keys met in one configuration.
 17. Staged uploads are deleted after 15 minutes without upload activity
     (section 5.1).
-18. A cache directory belongs to one server and one prefix; started with
+18. A stored narinfo is at most 1 MiB.
+19. A cache directory belongs to one server and one prefix; started with
     another, narrenhaus refuses and says why (section 7.1).
-19. A `check` command beside `serve` that prints the same advice and exits.
-20. For a user the Nix daemon does not trust, the check reads the system
+20. A `check` command beside `serve` that prints the same advice and exits.
+21. For a user the Nix daemon does not trust, the check reads the system
     configuration alone, since that is all the daemon honours (section 8).
-21. The store directory is `/nix/store`; a narinfo for another is refused.
+22. The store directory is `/nix/store`; a narinfo for another is refused.
 
 ## 3. Goals, non-goals, anti-goals
 
@@ -207,7 +211,8 @@ Non-goals (first version)
 - Service manager units, a NixOS or nix-darwin module.
 - Editing Nix configuration.
 - Access control, verification of builders, a shared signing key.
-- Retention: nothing deletes references on the server.
+- Retention and repair: nothing deletes or replaces references on the
+  server.
 - `log/`, `.ls`, `realisations/` / `build-trace-v2/`, `debuginfo/`.
 - HTTP range requests on NARs.
 - Serving references that narrenhaus did not write (the existing
@@ -220,9 +225,9 @@ Non-goals (first version)
 Anti-goals: it has failed, even if it works, when
 
 - a NAR it serves does not hash to the NarHash of the narinfo it served;
-- a running narrenhaus makes Nix hang or fail a build because the server
-  or the bucket is slow, down or unreachable (it answers 404 in time
-  instead);
+- a running narrenhaus makes Nix hang or fail a build or a substitution
+  because the server or the bucket is slow, down or unreachable (it
+  answers 404 in time instead);
 - it keeps a core store or any second copy of objects besides pack files;
 - it changes a Nix configuration file or needs root;
 - a real server endpoint ID or a machine's name enters the tree or a
@@ -239,7 +244,7 @@ Nix's base 32, 52 characters; `<H>` is 32) has two references.
 | Reference | Name | Example with prefix `acme/` |
 |---|---|---|
 | narinfo | `<prefix><H>.narinfo` | `acme/0c6kzph7l0dcbfmjap64f0czdafn3b7x.narinfo` |
-| content | `<prefix>nar/<N>.nar` | `acme/nar/1b9qv…52 characters….nar` |
+| content | `<prefix>nar/<N>.nar` | `acme/nar/<52 characters>.nar` |
 
 A name is the prefix, verbatim, followed by the path Nix asks narrenhaus
 for. The prefix is an opaque string; narrenhaus adds no separator and
@@ -313,7 +318,7 @@ with `--no-verify`. Two laptops given the same NAR build the same root.
 
 The recipe says how the NAR is rebuilt from the content reference and what
 must come out. Version 1 is a JSON object written exactly so, keys in this
-order, no spaces, no trailing newline:
+order, no spaces, no trailing newline, `narSize` in decimal:
 
 ```
 {"format":"narrenhaus-recipe","narHash":"sha256:<N>","narSize":<decimal>,"node":"nar","version":1}
@@ -328,7 +333,7 @@ of its tree. The result is `narSize` bytes long and hashes to `narHash`,
 which is also the hash in the reference's name.
 
 A reader that finds another `format` or a `version` it does not know must
-not serve the reference: it answers 404 and logs it, and does not treat the
+not serve the reference: it answers 404 and logs it, and does not count the
 reference as broken (section 6.4), since a newer narrenhaus may have
 written it. This is the room for a later recipe that reproduces something
 the tree cannot.
@@ -336,35 +341,63 @@ the tree cannot.
 ### 4.4 Narinfo reference
 
 The root is the content key of the stored narinfo text (section 5.2), built
-as a file: one Blob, or a FileNode over Blobs for a narinfo above 32 KiB
-(several hundred references). There is no directory around it. The
-reference's pack is a base pack of that one object or those few.
+as a file: one Blob, or, where the chunker cuts a text above 32 KiB, a
+FileNode over Blobs. There is no directory around it. It is pushed as a
+base pack of that one object or those few (`MinDedup` above 1, so no parent
+is ever chosen); a reader takes whatever packs the server names.
 
 ## 5. Upload
 
 Nix uploads a path as two requests: its NAR and its narinfo. Up to Nix 2.34
 each path is sent as its NAR, then its narinfo. From 2.35 a `nix copy`
-sends **all** NARs first, largest first, and then the narinfos in reference
-order, as many at once as the machine has cores.
+sends **all** NARs first, largest first, and then the narinfos, leaves of
+the reference graph first, as many at once as the machine has cores.
 
 narrenhaus ties the two together by the NAR's hash, which it computes from
 the NAR and reads from the narinfo's `NarHash`; the narinfo's `URL` field
 is not used for that.
 
-All upload work belongs to narrenhaus, not to the request that started it.
-It runs under the process's context and goes on if the client disconnects.
-There is one piece of content work per NAR hash and one piece of narinfo
-work per store hash; a request for one that is queued or running joins it
-and gets its result. At most four pushes run at once; the rest queue.
+**Work.** Upload work belongs to narrenhaus, not to the request that
+started it. It runs under the process's context and goes on if the client
+disconnects. There is one piece of content work per NAR hash and one piece
+of narinfo work per store hash; a request for one that is queued or running
+joins it and gets its result.
+
+**State.** Per NAR hash the process keeps an entry only while its content
+work is queued or running, has failed for now (with its staged NAR and the
+last error), or has failed for good (with the reason, until the next NAR
+`PUT` for that hash). A finished push leaves no entry: from then on
+narrenhaus goes by what the server says.
+
+**Order.** At most four content pushes run at once; the rest queue. Queued
+content work that a narinfo `PUT` has asked for, at any time in this
+process, runs before work no narinfo has asked for, each kind in the order
+it was first asked or arrived. Without this, Nix 2.35's order (largest NARs
+first, narinfos of leaf paths first) would leave each narinfo waiting
+behind the whole closure. Narinfo pushes have their own limit of eight and
+never wait behind content pushes.
+
+**Failure.** A push has failed for good when the server answers
+`bad_request` or `malformed_pack` (for example a pack over the server's
+size limit). Every other failure is for now: the server or bucket
+unreachable, a lost connection, a bucket error, the server's `internal`, an
+upload that outlived the server's upload timeout.
+
+**Error bodies** are plain text under 1024 bytes, because Nix shows a body
+only below that size.
 
 ### 5.1 `PUT /nar/<hash>.nar[.<ext>]`
 
-1. The body is decompressed as it arrives. The compression is recognised by
+1. narrenhaus needs a usable connection to the server before it reads the
+   body (section 9.3: the shared connection, or a dial within the 10
+   seconds of section 6.4). Without one it answers 502 and reads nothing,
+   so a copy fails at its first NAR and not after staging a whole closure.
+2. The body is decompressed as it arrives. The compression is recognised by
    the body's first bytes (xz, zstd, gzip, bzip2, or the `nix-archive-1`
    header of an uncompressed NAR), not by the extension: Nix gives gzip
    uploads no extension. Anything else is 415. zstd input may be several
    frames back to back (Nix 2.35 writes one per 16 MiB).
-2. The decompressed stream is parsed as a NAR by a strict reader. It
+3. The decompressed stream is parsed as a NAR by a strict reader. It
    rejects what Nix's own parser rejects and trailing bytes besides:
    unsorted or duplicate names; names that are empty, `.`, `..`, longer than
    255 bytes or contain `/` or NUL; symlink targets that are empty, contain
@@ -372,7 +405,7 @@ and gets its result. At most four pushes run at once; the rest queue.
    marker with a non-empty value; non-zero padding; bytes after the root
    node. While parsing, narrenhaus computes the SHA-256 and length of the
    decompressed stream: the NAR's hash `<N>` and size.
-3. Each node becomes core objects as in section 4.2. Objects are appended,
+4. Each node becomes core objects as in section 4.2. Objects are appended,
    each once, to a flat data file in the staging directory, with a table
    from key to offset and length. Then the recipe and the root directory
    are appended. Memory in use is the chunker's buffer (2 MiB) and the
@@ -380,55 +413,62 @@ and gets its result. At most four pushes run at once; the rest queue.
    file (it becomes the pack's index), so memory does not grow with the
    number of staged NARs. After this the staged file and table do not
    change and are read by position, so concurrent reads are safe.
-4. If the body was an uncompressed NAR, the hash in the URL must be `<N>`
-   (Nix names an uncompressed upload by its NAR hash); otherwise 400.
-5. The NAR is rebuilt from the staged objects exactly as section 6.3 does,
+5. If the body was an uncompressed NAR, the hash in the URL must be `<N>`
+   (Nix names an uncompressed upload by its NAR hash); otherwise 400. For
+   a compressed body the URL's hash is that of the compressed file and is
+   not checked.
+6. The NAR is rebuilt from the staged objects exactly as section 6.3 does,
    and its SHA-256 and length compared with what was received. A difference
    is 422 with a body that says narrenhaus cannot reproduce this NAR, and
    is logged as a defect.
-6. Content work for `<N>` starts, unless it is already queued, running or
-   done in this process, in which case the new staged copy is dropped. The
-   request is answered 200 with an empty body now; it does not wait for
-   the push.
+7. Content work for `<N>` starts and the request is answered 200 with an
+   empty body; it does not wait for the push. If an entry for `<N>` exists:
+   queued or running, the new staged copy is dropped; failed for now, the
+   new copy is dropped and the work starts again on the staged one; failed
+   for good, the entry is replaced and the work starts on the new copy.
 
-A malformed NAR is 400 and leaves nothing behind.
+A malformed NAR is 400, a failed write to staging is 507; both leave
+nothing behind.
 
 Content work for `<N>`:
 
-- Ask the server whether `<prefix>nar/<N>.nar` exists. If it does, and
-  this process has not found it broken (section 6.4), drop the staged NAR:
-  first writer wins. A reference found broken counts as absent and is
-  replaced.
+- Ask the server whether `<prefix>nar/<N>.nar` exists. If it does, drop
+  the staged NAR: first writer wins. If its root is not the one staged,
+  log both roots as a warning: it was written by another recipe version or
+  by something else, and whether it can be served shows on a pull.
 - Otherwise push the reference from the staged objects (section 9.1) with
   the parent rule of jaccard-store's CLI (`MinDedup` 0.5, set explicitly)
   and `TempDir` set to the cache directory's `tmp/`. Then move the staged
   data file into the pack cache as a complete pack for the root
   (section 7.1) and write the reference's record.
-- If the server or the bucket cannot be reached, the work has failed for
-  now and the NAR stays staged; the next request that needs `<N>` starts
-  it again. If the server refuses for a reason a repeat cannot cure (the
-  pack is over the server's size limit), the work has failed for good and
-  the staged NAR is dropped.
+- Failed for now: the NAR stays staged and the entry stays; the next
+  request that needs `<N>` starts the work again. Failed for good: the
+  staged NAR is dropped.
 
-`HEAD /nar/<hash>.nar` with a 52-character hash and no extension answers
-200 when the content reference exists on the server or its work is queued,
-running or done in this process, and 404 otherwise. With
+`HEAD /nar/<hash>.nar` with a 52-character hash and no extension is Nix's
+question "do I need to send this NAR" and nothing else. It answers 200 when
+content work for the hash is queued or running in this process or the
+server has the reference, 404 when neither, and 502 when the server could
+not be asked. It downloads nothing and sends no `Content-Length`. With
 `?compression=none` Nix asks this before each upload and skips a NAR that
-is already there. `HEAD` on a URL with an extension always answers 404:
-its hash is that of the compressed file, which narrenhaus does not keep.
+is already there. `HEAD` on a URL with an extension always answers 404: its
+hash is that of the compressed file, which narrenhaus does not keep. A gzip
+upload has no extension either; its hash names no content reference, so it
+gets 404 too.
 
 Staged NARs are deleted when 15 minutes have passed during which no upload
 request was being handled and no push was running or queued, and everything
-in staging is deleted at start. Age alone never deletes one.
+in staging is deleted at start. Age alone never deletes one. Deleting a
+staged NAR removes its entry.
 
 ### 5.2 The narinfo as stored
 
 `PUT /<H>.narinfo` carries Nix's narinfo. narrenhaus parses it (unknown
 keys are ignored, as Nix does) and stores this text:
 
-- `StorePath`, `NarHash` (as `sha256:<N>`), `NarSize`, `References`
-  (always present, `References: ` with the trailing space when empty),
-  `Deriver`, `Sig` lines and `CA` as uploaded;
+- `StorePath`, `NarHash` (as `sha256:<N>`, whatever form it arrived in),
+  `NarSize`, `References` (always present, `References: ` with the
+  trailing space when empty), `Deriver`, `Sig` lines and `CA` as uploaded;
 - `URL: nar/<N>.nar`;
 - `Compression: none`;
 - `FileHash` and `FileSize` equal to `NarHash` and `NarSize`;
@@ -436,7 +476,8 @@ keys are ignored, as Nix does) and stores this text:
   FileHash, FileSize, NarHash, NarSize, References, Deriver, Sig sorted,
   CA), every line ended by a line feed.
 
-The laptop's own signature is not stored; it is added when serving
+This is what Nix itself writes for an upload with `?compression=none`. The
+laptop's own signature is not stored; it is added when serving
 (section 6.2). Uploaded signatures stay valid, because a signature covers
 only the store path, NarHash, NarSize and references.
 
@@ -446,46 +487,57 @@ In order:
 
 1. Parse. The hash in the URL must be the hash part of `StorePath`,
    `StorePath` must be under `/nix/store`, `NarHash` must be a SHA-256,
-   and the body must be plain text (a `Content-Encoding` header is 415);
+   the stored text must not exceed 1 MiB, and the body must be plain text
+   (a `Content-Encoding` header is 415); otherwise 400.
+2. Make sure the content for `NarHash` is on the server.
+   - An entry that is queued or running: mark it as asked for by a narinfo
+     and wait for it.
+   - Failed for now: start it again and wait.
+   - Failed for good: 422 with the reason.
+   - No entry: ask the server whether `<prefix>nar/<N>.nar` exists. If not,
+     400 with a body that says no NAR with hash `<N>` was received.
+
+   While an entry exists, `NarSize` must equal the staged NAR's size;
    otherwise 400.
-2. Ask the server whether `<prefix><H>.narinfo` exists. If it does, and
-   this process has not found it broken, answer 200: first writer wins.
-3. Make sure the content for `NarHash` is on the server: if content work
-   for it is queued or running in this process, wait for it; if it failed
-   for now, start it again and wait; if this process knows nothing of it,
-   ask the server whether `<prefix>nar/<N>.nar` exists. Where this
-   process staged the NAR, `NarSize` must equal its size.
+3. Ask the server whether `<prefix><H>.narinfo` exists. If it does, answer
+   200: first writer wins.
 4. Build the stored narinfo, push the narinfo reference from that one
-   object, place its pack in the cache and write its record. Answer 200.
+   object as a base pack, place its pack in the cache and write its
+   record. Answer 200.
 
 The content reference is always on the server before the narinfo that
-names it.
+names it, and a 200 means both were there when it was given.
 
 | Outcome | Status |
 |---|---|
 | Both references on the server | 200 |
-| Malformed narinfo, or `NarSize` differs from the staged NAR (steps 1, 3) | 400 |
-| No content for `NarHash` here or on the server (3) | 400, body says the NAR was not received |
-| Content work failed for good, or the server refuses the narinfo push for a reason a repeat cannot cure | 422 with the server's message |
-| Server or bucket unreachable, connection lost (2, 3, 4) | 502; the NAR stays staged |
+| Malformed narinfo, or `NarSize` differs from the staged NAR | 400 |
+| No content for `NarHash` here or on the server | 400 |
+| Content work failed for good, or the server refuses the narinfo push with `bad_request` or `malformed_pack` | 422 with the reason |
+| Server or bucket unreachable, connection lost | 502; the NAR stays staged |
 
 Nix repeats a request that got 5xx or no answer, and the repeat finds the
 work or the staged NAR still there. Nix gives up on a request that has been
 silent for `stalled-download-timeout` (300 seconds by default) and, in
 2.35, repeats it up to four more times; the repeats join the work under
-way. A narinfo whose content push and queueing take longer than about 25
-minutes therefore still fails the copy, unless `nix copy` is run with
-`--option stalled-download-timeout <seconds>`; running the copy again after
-the push has finished succeeds at once.
+way. So a narinfo may wait about 25 minutes in all for its own content
+push, the pushes already running and those of narinfos asked for before
+it. Beyond that the copy fails, unless `nix copy` is run with
+`--option stalled-download-timeout <seconds>`. Running the copy again
+after the pushes have finished sends, with `?compression=none`, no NAR
+again and only the narinfos; with a compression every NAR is compressed
+and sent again and then dropped.
 
 Limits inherited from jaccard-store: 16 GiB of uncompressed objects per
 pack by default (the server's `--max-pack-size`, refused only after the
 pack has been built), 256 MiB per object (chunks are at most 1 MiB), 2^24
-objects per pack.
+objects per pack, and one hour from the start of an upload to its commit
+(the server's `--upload-timeout`).
 
 ## 6. Serving
 
-All answers work for `GET` and `HEAD` alike, `HEAD` without a body.
+All answers work for `GET` and `HEAD` alike, `HEAD` without a body, except
+`HEAD` on a NAR URL, which section 5.1 defines.
 
 ### 6.1 `GET /nix-cache-info`
 
@@ -499,16 +551,17 @@ Priority: <priority>
 
 1. Ask the server for `<prefix><H>.narinfo` (one round trip, section 9.2).
 2. Not found: 404, and any local record for the name is removed.
-3. Found with root R. If the pack for R is not cached, download it
-   (section 7.2): an index of a few dozen bytes and a data object about the
-   size of the narinfo. Read the text with `fstree.WriteContent`. Its
-   `StorePath` must have the hash `<H>` and its `URL` must be
-   `nar/<its NarHash>.nar`; otherwise the reference is broken
-   (section 6.4). Write the record.
-4. Server unreachable: answer from the local record and its pack if they
+3. Found with root R. Before anything is downloaded: R must be a Blob or
+   FileNode key, its length field at most 1 MiB, and the packs the server
+   names must announce no more than 4 MiB of objects in all; otherwise the
+   reference is broken (section 6.4). `HEAD` answers 200 here.
+4. If the pack for R is not cached, download it (section 7.2): an index of
+   a few dozen bytes and a data object about the size of the narinfo. Read
+   the text with `fstree.WriteContent`. Its `StorePath` must have the hash
+   `<H>`, its `URL` must be `nar/<its NarHash>.nar` and its `Compression`
+   `none`; otherwise the reference is broken. Write the record.
+5. Server unreachable: answer from the local record and its pack if they
    are there, otherwise 404.
-
-`HEAD` stops after step 1 or 2: it answers 200 or 404 without downloading.
 
 The answer is the stored narinfo with one more `Sig` line: the laptop's
 signature over Nix's fingerprint
@@ -516,20 +569,23 @@ signature over Nix's fingerprint
 store paths, sorted, joined by commas>`, as `<key name>:<base64 of the
 64-byte Ed25519 signature>`. Content type `text/x-nix-narinfo`.
 
-No NAR content is fetched to answer a narinfo.
+No NAR content is fetched to answer a narinfo, and the content reference is
+not looked at.
 
 ### 6.3 `GET /nar/<N>.nar`
 
 1. Find the root: from the local record of `<prefix>nar/<N>.nar` if its
    packs are all cached, otherwise by asking the server (not found, or
-   unreachable without a usable record: 404).
-2. Make the packs local (section 7.2). The first time a content reference
-   is made local, read `recipe` from the root (unknown format or version:
-   section 4.3; a `narHash` other than `<N>`: broken), rebuild the NAR once
-   from the tree and compare its SHA-256 and length with the recipe's
-   `narHash` and `narSize` (a difference is a broken reference), and note
-   in the record that it passed. A pack placed by a local upload passed
-   this in step 5 of section 5.1.
+   unreachable without a usable record: 404). A root that is not a DirLeaf
+   or DirNode key is broken, without a download.
+2. Make the reference local (section 7.2). For a content reference the
+   last step of that is a check, made once per root: read `recipe` (unknown
+   format or version: section 4.3; a `narHash` other than `<N>`: broken),
+   rebuild the NAR from the tree and compare its SHA-256 and length with
+   the recipe's `narHash` and `narSize` (a difference is broken). The
+   check runs under the process's context like the download, later
+   requests join it, and its result is the "checked" mark in the record. A
+   pack placed by a local upload passed it in step 6 of section 5.1.
 3. Send `Content-Length: <narSize>`, `Content-Type: application/x-nix-nar`,
    then the NAR, written by walking the `nar` entry: directory entries in
    stored order, a file's length from its content key (`key.Length()`), its
@@ -538,14 +594,16 @@ No NAR content is fetched to answer a narinfo.
    writer stops, cuts the connection and logs a defect.
 
 Nothing is sent before step 2 has succeeded, because after the header a
-failure can only be shown by cutting the connection. `HEAD` answers after
-step 1 without downloading.
+failure can only be shown by cutting the connection.
 
 ### 6.4 Time limits and errors
 
 Nix abandons a request that is silent for 300 seconds and then counts it as
-an error, which can fail a build; a 404 it survives. So before the response
-header narrenhaus answers 404 in time and never 5xx:
+an error, which can fail a build; a 404 it survives. So when serving
+(narinfo `GET` and `HEAD`, NAR `GET`) narrenhaus answers 404 in time and
+never 5xx before the response header. Upload requests are different: they
+answer 502 when the server cannot be reached, so that a copy fails fast
+and says why.
 
 - **Lookup.** One request waits at most 10 seconds for the connection and
   the lookup round trip together. Beyond that the server counts as
@@ -554,20 +612,21 @@ header narrenhaus answers 404 in time and never 5xx:
 - **Dial.** The dial runs under the process's context with a 30-second
   limit and is not abandoned when a waiting request gives up. After a dial
   has failed, requests fail fast for 30 seconds instead of dialling again.
-- **Packs.** If a request's packs are not local 240 seconds after it
-  arrived, it is answered 404 and the download goes on (section 7.2), so a
-  later request finds the packs.
+- **Packs.** If a request's reference is not local (and, for content,
+  checked) 240 seconds after the request arrived, it is answered 404 and
+  the work goes on (section 7.2), so a later request finds it done.
 - **Transfer failure.** A bucket error, a stalled or cut transfer, an
   expired URL or a full disk is not a broken reference: the pack being
   downloaded is discarded, packs already verified are kept, the request is
   answered 404 and the cause is logged.
-- **Broken reference.** A content root that is not the wrapper of
-  section 4.2, a narinfo that fails the checks of section 6.2, an index or
-  object that does not match its key, a tree that is incomplete after all
-  packs are local, or a NAR that does not match its recipe and name. It is
-  404 to Nix and an error in the log; its packs are dropped from the cache,
-  and the process remembers the name and root as broken, which lets an
-  upload replace it (section 5).
+- **Broken reference.** A root of the wrong kind or size (sections 6.2,
+  6.3), a narinfo that fails the checks of section 6.2, an index or object
+  that does not match its key, a tree that is incomplete after all packs
+  are local, or a NAR that does not match its recipe and name. It is 404 to
+  Nix and an error in the log, and its packs are dropped from the cache.
+  The process remembers the name and root, so later requests that find the
+  same root there are answered 404 without downloading again. narrenhaus
+  does not replace a broken reference (section 12).
 - Every other path is 404.
 
 ## 7. Pack cache
@@ -591,7 +650,8 @@ tmp/                      downloads and packs being built
   otherwise it is a **patch** and names its parent's root. One root's
   complete pack serves any reference with that root and any patch that
   names it as parent. Narinfo packs and content packs share the one cache
-  and the one eviction order.
+  and the one eviction order; their roots are keys of different kinds and
+  cannot collide.
 - A record exists only while its root's pack is cached. It holds no narinfo
   text and no object bytes.
 - Files are written under `tmp/` and renamed into place; `.meta` goes last
@@ -617,8 +677,9 @@ tmp/                      downloads and packs being built
 - A download belongs to the cache, not to the request that started it: it
   runs under the process's context, goes on if the client disconnects, and
   later requests for the same root join it. One download per root runs at a
-  time and at most eight in all. A transfer that moves no byte for 30
-  seconds has failed.
+  time. At most eight content downloads run at once; narinfo packs have a
+  limit of their own (sixteen) and never wait behind a content download. A
+  transfer that moves no byte for 30 seconds has failed.
 - A download fetches the index, then streams the data through
   decompression, checks each object against its key (`verify.Object`) and
   writes the objects in offset order into `tmp/`; unverified bytes are
@@ -800,15 +861,18 @@ error is not taken over.
 By the owner's instruction:
 
 - The additions are made first, in `~/amber-store/jaccard-store`, on a
-  branch. The builder opens the pull request, merges it once its checks
-  pass, and cuts the release (the next minor version, v0.8.0, as a tag
-  `v*` pushed to GitHub, which builds the image and the GitHub release as
-  the earlier ones were made).
-- narrenhaus's `go.mod` names that released version and nothing else: no
-  pseudo-version of a branch or commit, no `replace`. Work on narrenhaus
-  that needs the additions starts after the release exists.
-- The additions change no behaviour of the existing commands, so the
-  running server needs no rollout.
+  branch. The builder opens the pull request, waits for the Test workflow,
+  merges, and once that workflow is green on `main` cuts the release: the
+  next minor version, v0.8.0, as a tag `v*` on `main`'s commit, pushed to
+  GitHub, which builds the image and the GitHub release as the earlier
+  ones were made.
+- narrenhaus's `go.mod` always names a released version of jaccard-store:
+  no pseudo-version of a branch or commit, no `replace`. Work on narrenhaus
+  that needs the additions starts after the release exists. If that work
+  shows the additions lacking, the correction takes the same route (pull
+  request, merge, a further release) and `go.mod` moves to it.
+- The additions change no behaviour of the existing commands or of the
+  server, so the running server needs no rollout.
 - Go and dependency versions follow jaccard-store's `go.mod` (core,
   go-iroh), so the types agree.
 
@@ -865,21 +929,32 @@ pushes still running then are abandoned.
 
 ## 12. Known limits
 
-- **Staging is outside the cache limit.** With Nix 2.35 and later a
-  `nix copy` sends all NARs before the first narinfo, and they arrive
-  faster than they can be pushed, so staging can hold the uncompressed
-  size of everything being copied. It drains as pushes finish.
+- **Staging is outside the cache limit and nothing bounds it.** With Nix
+  2.35 and later a `nix copy` sends all NARs before the first narinfo, and
+  they arrive faster than they can be pushed, so a copy needs free disk for
+  the uncompressed size of what it copies, on top of the cache limit and of
+  up to four compressed packs being built. It drains as pushes finish. A
+  full disk fails the copy with 507.
+- **narrenhaus does not repair.** A reference found broken stays, and the
+  path is not substitutable from narrenhaus, until someone deletes the
+  reference (`jaccard-store rm`) and uploads again. The same holds for a
+  content reference deleted while its narinfo remains: the narinfo is
+  answered, the NAR is 404, and Nix builds the path or looks elsewhere. A
+  broken pack that other names or patch packs still hold cannot be
+  replaced by any client.
 - A pull of a patch fetches its whole base pack, which can be as large as
   the reference again.
-- A NAR request whose packs take more than 240 seconds to arrive gets a
-  404, and Nix builds the path or looks elsewhere although the pack
-  arrives shortly after.
+- A NAR request whose packs take more than 240 seconds to arrive and check
+  gets a 404, and Nix builds the path or looks elsewhere although the pack
+  is ready shortly after.
 - Nix remembers a narinfo 404 for an hour
   (`narinfo-cache-negative-ttl`). That covers a path a colleague pushes
   after this laptop asked for it, and 404s given while the server was
   unreachable.
-- A push that takes longer than Nix's 300-second limit shows as repeated
-  requests, and beyond about 25 minutes as a failed copy (section 5.3).
+- A narinfo `PUT` that waits longer than Nix's 300-second limit shows as
+  repeated requests, and beyond about 25 minutes as a failed copy
+  (section 5.3). On a verifying server every commit, a narinfo's included,
+  also waits for one of the server's verify jobs, shared by all clients.
 - `nix copy` copies whole closures, so paths that came from
   cache.nixos.org are pushed too.
 - A path uploaded with a compression (xz is Nix's default) leaves Nix's
@@ -887,9 +962,12 @@ pushes still running then are abandoned.
   in the memory of the user account that ran `nix copy`. With
   `?compression=none`, which the advice prints, the URL Nix remembers is
   the one narrenhaus serves.
-- A store path costs two references and four bucket objects. A content
-  reference whose narinfo never arrived, or lost a race, stays on the
-  server.
+- A store path costs two references and four to six bucket objects (index
+  and data per pack, and links for each base pack on a verifying server).
+  A content reference whose narinfo never arrived, or lost a race, stays
+  on the server.
+- Small packs cost more disk than the cache counts: a cached narinfo is
+  four small files, each rounded up to a filesystem block.
 - Pushes running at the same time cannot be patches of one another, so a
   first upload of many related paths stores more than a later one would.
 - Anyone who knows the server's endpoint ID can read, replace and delete
@@ -916,9 +994,11 @@ pushes still running then are abandoned.
   change in the chunking library, the encoding, the recipe or the metadata
   convention fails the build. The same tree is read back with core's own
   decoder and its modes compared.
-- **Narinfo**: parsing what Nix writes, the stored form, the signature
-  (checked against a fingerprint computed independently and, where `nix` is
-  present, by Nix itself), a narinfo above 32 KiB.
+- **Narinfo**: parsing what Nix writes (NarHash in each form Nix accepts),
+  the stored form, the signature (checked against a fingerprint computed
+  independently and, where `nix` is present, by Nix itself), a narinfo
+  whose text the chunker splits, so that its root is a FileNode, and one
+  over 1 MiB, refused.
 - **Pack cache**: expanded reads, patch with parent, a cached patch whose
   parent changed, stamps, eviction order, held packs, the over-limit case,
   recovery of a directory left by a killed process.
@@ -927,19 +1007,36 @@ pushes still running then are abandoned.
   jaccard-nfs-nix-store's `jstest` set one up. Two narrenhaus instances
   with separate directories and one prefix: upload through one, fetch
   through the other, compare NAR bytes and narinfo, and assert that the
-  narinfo answer fetched no content pack. Also: all NARs before any
-  narinfo; two store paths with one content; a narinfo `PUT` joining a
-  slowed content push; a 502 that leaves the NAR staged and a repeat that
-  succeeds; `HEAD` on a NAR the server has; a server-side connection
-  killed between two narinfo requests, the second still answering 200; a
-  refused push that leaves a concurrent push running; a content reference
-  whose tree does not match its recipe.
+  narinfo answer fetched no content pack. Also:
+  - all NARs before any narinfo, behind a slowed push: the content a
+    narinfo asks for is pushed before content nobody waits for;
+  - two store paths with one content;
+  - a narinfo `PUT` joining a slowed content push;
+  - a 502 that leaves the NAR staged, and a repeat that succeeds;
+  - with the server down, a NAR `PUT` and a NAR `HEAD` answer 502 and
+    staging stays empty;
+  - a narinfo `PUT` after a restart (400, no NAR received);
+  - `HEAD` 200 for queued work that then fails for good (422 on the
+    narinfo, 404 on the next `HEAD`);
+  - a narinfo `PUT` whose reference exists and names another NAR hash;
+  - `HEAD` on a NAR the server has;
+  - a gzip body sent to an extension-less URL named by the gzip file's
+    hash: accepted, stored under the NAR's hash, `HEAD` on that URL 404
+    before and after;
+  - a narinfo answered while eight slowed content downloads run;
+  - a server-side connection killed between two narinfo requests, the
+    second still answering 200;
+  - a refused push that leaves a concurrent push running;
+  - broken references: a narinfo name pointing at a large directory root
+    (404 without a download), a content reference whose tree does not
+    match its recipe, an object that does not match its key.
 - **With real Nix**, where the `nix` program is present: `nix copy --to` a
   closure of several paths with references between them into one instance
   and substitute it from another into a throwaway store; with the default
-  xz upload, with `?compression=none`, and with zstd and a NAR over 16 MiB;
-  and the stopped-narrenhaus case of section 8.1. Each such test runs
-  `nix` with `XDG_CACHE_HOME` pointing at a fresh directory,
+  xz upload, with `?compression=none` (a second copy after the narinfo
+  references were removed sends no NAR), and with zstd and a NAR over
+  16 MiB; and the stopped-narrenhaus case of section 8.1. Each such test
+  runs `nix` with `XDG_CACHE_HOME` pointing at a fresh directory,
   `NIX_USER_CONF_FILES` empty and `NIX_CONFIG` unset, and uses its own
   store paths, because Nix remembers what a cache URL answered.
 - **Setup check**: against captured `nix config show --json` and
