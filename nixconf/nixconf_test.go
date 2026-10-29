@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -776,6 +777,10 @@ func TestNixCannotBeRun(t *testing.T) {
 		"substituters a table": `{"substituters":{"value":{}},"trusted-public-keys":{"value":[]},"fallback":{"value":false}}`,
 		"fallback a number":    `{"substituters":{"value":[]},"trusted-public-keys":{"value":[]},"fallback":{"value":3}}`,
 		"settings not objects": `{"substituters":["http://127.0.0.1:8484"],"trusted-public-keys":[],"fallback":true}`,
+		"substituters null":    `{"substituters":{"value":null},"trusted-public-keys":{"value":[]},"fallback":{"value":false}}`,
+		"keys null":            `{"substituters":{"value":[]},"trusted-public-keys":{"value":null},"fallback":{"value":false}}`,
+		"fallback null":        `{"substituters":{"value":[]},"trusted-public-keys":{"value":[]},"fallback":{"value": null }}`,
+		"no value":             `{"substituters":{},"trusted-public-keys":{"value":[]},"fallback":{"value":false}}`,
 	}
 	for name, output := range unreadable {
 		t.Run("output "+name, func(t *testing.T) {
@@ -928,6 +933,114 @@ func TestUserFileFollowsXDGConfigHome(t *testing.T) {
 	})
 }
 
+func TestUserFileFollowsNixUserConfFiles(t *testing.T) {
+	// With NIX_USER_CONF_FILES set, Nix reads the user's settings from the
+	// files it names and from no other; the first has the last word.
+	m := trustedMachine(t)
+	env := m.env()
+	env.ConfigHome = "/home/alice/etc"
+	env.UserConfFiles, env.UserConfFilesSet = "/home/alice/work/nix.conf:/srv/team/nix.conf", true
+	r := Check(context.Background(), env, Input{Listen: testListen, PublicKey: testKey})
+	wantContains(t, r.Text, "Add to /home/alice/work/nix.conf, which needs neither root nor a restart:")
+	wantLacks(t, r.Text, userConf, "/home/alice/etc", "/srv/team", "NIX_USER_CONF_FILES")
+
+	t.Run("fallback alone", func(t *testing.T) {
+		m := untrustedMachine(t)
+		env := m.env()
+		env.UserConfFiles, env.UserConfFilesSet = "::relative/nix.conf:", true
+		r := Check(context.Background(), env, Input{Listen: testListen, PublicKey: testKey})
+		wantContains(t, r.Text, "Add to relative/nix.conf, which needs neither root nor a restart:")
+		wantLacks(t, r.Text, userConf, "NIX_USER_CONF_FILES")
+	})
+	t.Run("set and naming no file", func(t *testing.T) {
+		// Nix then reads no file of the user's at all, and the advice
+		// must not read as if the lines would count where they are put.
+		for _, files := range []string{"", ":", "::"} {
+			env := m.env()
+			env.UserConfFiles, env.UserConfFilesSet = files, true
+			r := Check(context.Background(), env, Input{Listen: testListen, PublicKey: testKey})
+			wantContains(t, r.Text, "Add to "+userConf, "NIX_USER_CONF_FILES is set and names no file")
+			if n := strings.Count(r.Text, "NIX_USER_CONF_FILES"); n != 1 {
+				t.Errorf("%q: the note is printed %d times:\n%s", files, n, r.Text)
+			}
+		}
+	})
+	t.Run("not set", func(t *testing.T) {
+		env := m.env()
+		env.UserConfFiles = "/home/alice/work/nix.conf"
+		r := Check(context.Background(), env, Input{Listen: testListen, PublicKey: testKey})
+		wantContains(t, r.Text, "Add to "+userConf)
+		wantLacks(t, r.Text, "/home/alice/work", "NIX_USER_CONF_FILES")
+	})
+	t.Run("nothing to add to it", func(t *testing.T) {
+		m := trustedMachine(t)
+		m.full = ready()
+		env := m.env()
+		env.UserConfFilesSet = true
+		r := Check(context.Background(), env, Input{Listen: testListen, PublicKey: testKey})
+		if !r.Configured {
+			t.Errorf("not configured:\n%s", r.Text)
+		}
+		wantLacks(t, r.Text, "NIX_USER_CONF_FILES")
+	})
+}
+
+func TestRunsOfNixHaveATimeLimit(t *testing.T) {
+	// The check bounds its runs of nix itself, all of them together, so
+	// that a caller without a deadline is not kept by a daemon that does
+	// not answer.
+	const limit = 20 * time.Second
+	for name, m := range map[string]*machine{
+		"trusted":        trustedMachine(t),
+		"untrusted":      untrustedMachine(t),
+		"old nix":        {t: t, full: stock(), system: stock(), noConfig: true, info: []byte(`{"trusted":0}`)},
+		"nix that fails": {t: t, nixErr: errors.New("exit status 1")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := m.env()
+			run, runs := env.Run, 0
+			var started time.Time
+			env.Run = func(ctx context.Context, changes []string, args ...string) ([]byte, error) {
+				runs++
+				deadline, ok := ctx.Deadline()
+				switch {
+				case !ok:
+					t.Errorf("nix %q was run without a time limit", args)
+				case deadline.After(started.Add(limit + time.Second)):
+					t.Errorf("nix %q may run until %v after the check began, want at most %v", args, deadline.Sub(started), limit)
+				}
+				return run(ctx, changes, args...)
+			}
+			started = time.Now()
+			Check(context.Background(), env, Input{Listen: testListen, PublicKey: testKey})
+			if runs < 2 {
+				t.Fatalf("nix was run %d times", runs)
+			}
+
+			// A caller's own, shorter limit stays.
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			env.Run = func(ctx context.Context, changes []string, args ...string) ([]byte, error) {
+				if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > time.Second {
+					t.Errorf("nix %q was run with the limit %v (%v), want the caller's second", args, time.Until(deadline), ok)
+				}
+				return run(ctx, changes, args...)
+			}
+			Check(ctx, env, Input{Listen: testListen, PublicKey: testKey})
+		})
+	}
+	// The limit is not shorter than it is said to be.
+	env := trustedMachine(t).env()
+	run := env.Run
+	env.Run = func(ctx context.Context, changes []string, args ...string) ([]byte, error) {
+		if deadline, _ := ctx.Deadline(); time.Until(deadline) < limit-5*time.Second {
+			t.Errorf("nix %q was run with %v left, want about %v", args, time.Until(deadline), limit)
+		}
+		return run(ctx, changes, args...)
+	}
+	Check(context.Background(), env, Input{Listen: testListen, PublicKey: testKey})
+}
+
 func TestEnviron(t *testing.T) {
 	base := []string{"PATH=/bin", "NIX_CONFIG=extra-substituters = http://x", "HOME=/home/alice", "NIX_CONFIGURED=1"}
 	got := environ(base, []string{"NIX_USER_CONF_FILES=", "NIX_CONFIG"})
@@ -973,8 +1086,9 @@ func TestSystemAgainstNix(t *testing.T) {
 	t.Setenv("NIX_CONFIG", "extra-substituters = "+marker)
 	env := System()
 	ctx := context.Background()
-	if got, want := env.userConf(), configHome+"/nix/nix.conf"; got != want {
-		t.Errorf("the user's file is %q, want %q", got, want)
+	userFile, read := env.userConf()
+	if want := configHome + "/nix/nix.conf"; userFile != want || !read {
+		t.Errorf("the user's file is %q (read %v), want %q", userFile, read, want)
 	}
 
 	full, err := readSettings(ctx, env, nil)
@@ -985,7 +1099,7 @@ func TestSystemAgainstNix(t *testing.T) {
 		t.Errorf("the user's view lacks the substituter of NIX_CONFIG: %q", full.substituters)
 	}
 	if !slices.Contains(full.substituters, userMarker) {
-		t.Errorf("the user's view lacks the substituter of %s: %q", env.userConf(), full.substituters)
+		t.Errorf("the user's view lacks the substituter of %s: %q", userFile, full.substituters)
 	}
 	system, err := readSettings(ctx, env, daemonEnv)
 	if err != nil {
@@ -1006,6 +1120,55 @@ func TestSystemAgainstNix(t *testing.T) {
 	wantContains(t, r.Text, "nix copy --to 'http://127.0.0.1:1?compression=none' <path>")
 	wantLacks(t, r.Text, "could not be")
 	t.Log(r.Text)
+
+	t.Run("NIX_USER_CONF_FILES", func(t *testing.T) {
+		// Nix reads the files the variable names and not the one under
+		// XDG_CONFIG_HOME, and the first of them has the last word: it is
+		// the one the advice names.
+		const firstMarker, secondMarker = marker + "-first", marker + "-second"
+		dir := t.TempDir()
+		first, second := dir+"/first.conf", dir+"/second.conf"
+		for file, text := range map[string]string{
+			first:  "extra-substituters = " + firstMarker + "\nfallback = true\n",
+			second: "extra-substituters = " + secondMarker + "\nfallback = false\n",
+		} {
+			if err := os.WriteFile(file, []byte(text), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Setenv("NIX_CONFIG", "")
+		t.Setenv("NIX_USER_CONF_FILES", ":"+first+":"+second)
+		env := System()
+		if got, read := env.userConf(); got != first || !read {
+			t.Errorf("the user's file is %q (read %v), want %q", got, read, first)
+		}
+		full, err := readSettings(ctx, env, nil)
+		if err != nil {
+			t.Fatalf("the user's view: %v", err)
+		}
+		if !slices.Contains(full.substituters, firstMarker) || !slices.Contains(full.substituters, secondMarker) {
+			t.Errorf("the user's view lacks a substituter of the files named: %q", full.substituters)
+		}
+		if slices.Contains(full.substituters, userMarker) {
+			t.Errorf("the user's view has the substituter of %s: %q", userFile, full.substituters)
+		}
+		if !full.fallback {
+			t.Error("fallback is off: the second file had the last word")
+		}
+
+		// Set and naming nothing, no file of the user's is read.
+		t.Setenv("NIX_USER_CONF_FILES", "")
+		env = System()
+		if got, read := env.userConf(); got != userFile || read {
+			t.Errorf("the user's file is %q (read %v), want %q, not read", got, read, userFile)
+		}
+		if full, err = readSettings(ctx, env, nil); err != nil {
+			t.Fatalf("the user's view: %v", err)
+		}
+		if slices.Contains(full.substituters, userMarker) {
+			t.Errorf("the user's view has the substituter of %s: %q", userFile, full.substituters)
+		}
+	})
 }
 
 func TestSystem(t *testing.T) {
@@ -1016,6 +1179,21 @@ func TestSystem(t *testing.T) {
 	if home, err := os.UserHomeDir(); err == nil && env.Home != home {
 		t.Errorf("Home = %q, want %q", env.Home, home)
 	}
+	t.Run("the user's files", func(t *testing.T) {
+		t.Setenv("XDG_CONFIG_HOME", "/somewhere/etc")
+		t.Setenv("NIX_USER_CONF_FILES", "/somewhere/nix.conf:/elsewhere/nix.conf")
+		if got, read := System().userConf(); got != "/somewhere/nix.conf" || !read {
+			t.Errorf("with NIX_USER_CONF_FILES: the user's file is %q (read %v)", got, read)
+		}
+		t.Setenv("NIX_USER_CONF_FILES", "")
+		if got, read := System().userConf(); got != "/somewhere/etc/nix/nix.conf" || read {
+			t.Errorf("with NIX_USER_CONF_FILES empty: the user's file is %q (read %v)", got, read)
+		}
+		os.Unsetenv("NIX_USER_CONF_FILES")
+		if got, read := System().userConf(); got != "/somewhere/etc/nix/nix.conf" || !read {
+			t.Errorf("without NIX_USER_CONF_FILES: the user's file is %q (read %v)", got, read)
+		}
+	})
 	t.Run("nix missing", func(t *testing.T) {
 		t.Setenv("PATH", t.TempDir())
 		if _, err := env.Run(context.Background(), nil, "--version"); err == nil {

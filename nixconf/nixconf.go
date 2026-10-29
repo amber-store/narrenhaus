@@ -66,17 +66,26 @@ type Env struct {
 	// ConfigHome is XDG_CONFIG_HOME, under which Nix looks for the user's
 	// nix/nix.conf. Empty means Home/.config.
 	ConfigHome string
+	// UserConfFiles is NIX_USER_CONF_FILES, and UserConfFilesSet whether
+	// the variable is set at all. Nix then reads the user's settings from
+	// the files it names, separated by colons, the first having the last
+	// word, and from none under ConfigHome.
+	UserConfFiles    string
+	UserConfFilesSet bool
 }
 
 // System is the Env of the real machine.
 func System() Env {
 	home, _ := os.UserHomeDir()
+	files, set := os.LookupEnv("NIX_USER_CONF_FILES")
 	return Env{
-		Run:        runNix,
-		ReadFile:   os.ReadFile,
-		Readlink:   os.Readlink,
-		Home:       home,
-		ConfigHome: os.Getenv("XDG_CONFIG_HOME"),
+		Run:              runNix,
+		ReadFile:         os.ReadFile,
+		Readlink:         os.Readlink,
+		Home:             home,
+		ConfigHome:       os.Getenv("XDG_CONFIG_HOME"),
+		UserConfFiles:    files,
+		UserConfFilesSet: set,
 	}
 }
 
@@ -243,6 +252,10 @@ func parseSettings(out []byte) (settings, error) {
 		if !ok || len(setting.Value) == 0 {
 			return settings{}, fmt.Errorf("the output has no setting %q", read.name)
 		}
+		// A null would be read as any type, and as nothing.
+		if string(setting.Value) == "null" {
+			return settings{}, fmt.Errorf("the output's setting %q is not understood: its value is null", read.name)
+		}
 		if err := json.Unmarshal(setting.Value, read.into); err != nil {
 			return settings{}, fmt.Errorf("the output's setting %q is not understood: %v", read.name, err)
 		}
@@ -343,15 +356,28 @@ func includesCustom(conf []byte) bool {
 	return false
 }
 
-// userConf is the user's own nix.conf, as a path to print.
-func (env Env) userConf() string {
+// userConf is the user's own nix.conf, as a path to print: the first file
+// NIX_USER_CONF_FILES names, or the one under ConfigHome. read is false
+// when the variable is set and names no file: Nix then reads none of the
+// user's, and the path is the one it would read without the variable.
+func (env Env) userConf() (file string, read bool) {
+	if env.UserConfFilesSet {
+		// Nix leaves out the empty parts.
+		for file := range strings.SplitSeq(env.UserConfFiles, ":") {
+			if file != "" {
+				return file, true
+			}
+		}
+	}
 	switch {
 	case env.ConfigHome != "":
-		return filepath.Join(env.ConfigHome, "nix", "nix.conf")
+		file = filepath.Join(env.ConfigHome, "nix", "nix.conf")
 	case env.Home != "":
-		return filepath.Join(env.Home, ".config", "nix", "nix.conf")
+		file = filepath.Join(env.Home, ".config", "nix", "nix.conf")
+	default:
+		file = "~/.config/nix/nix.conf"
 	}
-	return "~/.config/nix/nix.conf"
+	return file, !env.UserConfFilesSet
 }
 
 // Check reads the machine's Nix configuration and reports whether Nix
@@ -361,7 +387,8 @@ func Check(ctx context.Context, env Env, in Input) Report {
 	ctx, cancel := context.WithTimeout(ctx, timeLimit)
 	defer cancel()
 
-	a := advice{url: URL(in.Listen), key: in.PublicKey, userConf: env.userConf()}
+	a := advice{url: URL(in.Listen), key: in.PublicKey}
+	a.userConf, a.userConfRead = env.userConf()
 	configured := a.examine(ctx, env)
 
 	a.paragraph("To upload a store path: nix copy --to '" + a.url + "?compression=none' <path>\n" +
@@ -395,7 +422,10 @@ type advice struct {
 	url      string // narrenhaus's substituter URL
 	key      string // narrenhaus's public key, "<name>:<base64>"
 	userConf string // the user's nix.conf
-	text     strings.Builder
+	// userConfRead is false when NIX_USER_CONF_FILES keeps Nix from
+	// reading any file of the user's.
+	userConfRead bool
+	text         strings.Builder
 }
 
 // paragraph adds s to the text, after an empty line unless it is the
@@ -411,6 +441,17 @@ func (a *advice) paragraph(s string) {
 // lines adds an indented block of lines to copy.
 func (a *advice) lines(lines ...string) {
 	a.paragraph("    " + strings.Join(lines, "\n    "))
+}
+
+// userLines adds the lines that belong in the user's nix.conf, with what
+// comes before the file's name, and says so when Nix does not read it.
+func (a *advice) userLines(before string, lines ...string) {
+	a.paragraph(before + a.userConf + ", which needs neither root nor a restart:")
+	a.lines(lines...)
+	if !a.userConfRead {
+		a.paragraph("NIX_USER_CONF_FILES is set and names no file, so Nix reads no configuration file of this user's: " +
+			"the lines count once the variable is unset or names " + a.userConf + ".")
+	}
 }
 
 func (a *advice) substituterLine() string { return "extra-substituters = " + a.url }
@@ -481,7 +522,6 @@ func (a *advice) examine(ctx context.Context, env Env) bool {
 		options = append(options, `nix.settings.extra-trusted-public-keys = [ "`+a.key+`" ];`)
 	}
 
-	const easy = ", which needs neither root nor a restart:"
 	switch {
 	case len(missing) == 0:
 	case isTrusted:
@@ -489,8 +529,7 @@ func (a *advice) examine(ctx context.Context, env Env) bool {
 		if !full.fallback {
 			missing = append(missing, fallbackLine)
 		}
-		a.paragraph("The Nix daemon trusts this user. Add to " + a.userConf + easy)
-		a.lines(missing...)
+		a.userLines("The Nix daemon trusts this user. Add to ", missing...)
 		if !full.fallback {
 			a.paragraph(fallbackReason)
 		}
@@ -517,8 +556,7 @@ func (a *advice) examine(ctx context.Context, env Env) bool {
 		}
 	}
 	if !full.fallback {
-		a.paragraph("Add to " + a.userConf + easy)
-		a.lines(fallbackLine)
+		a.userLines("Add to ", fallbackLine)
 		a.paragraph(fallbackReason)
 	}
 	return false
