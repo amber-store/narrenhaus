@@ -3,9 +3,12 @@
 Date: 2026-10-29. Status: approved by the owner ("looks good, go ahead and
 do it all"), including the calls of section 2.3.
 Revised after the whole-branch review of the built program, where the fixes
-that followed it changed what this document states; the decisions the
-revision added are entries 23 to 33 of section 2.3, calls the owner has not
-yet confirmed.
+that followed it changed what this document states, and corrected once more
+after the revised document was checked against the code. The decisions the
+revision added, and the calls of the builder that the check found in the
+program or in the body without an entry, are entries 23 to 45 of
+section 2.3, calls the owner has not yet confirmed. One sentence of the
+approved section 1 was changed and is marked there.
 Reviewed twice against jaccard-store v0.7.0, Amber-Store Core v0.10.0 and
 the source of Nix 2.26.1 and 2.35.4 (the owner's machine runs 2.35.4).
 When it was approved, nothing in it had been run against a live cache; what
@@ -33,9 +36,17 @@ Success: on laptop A, `nix copy --to http://127.0.0.1:8484 <path>` succeeds;
 on laptop B, with narrenhaus configured as a substituter and the same server
 and prefix, Nix substitutes `<path>` from it and the path it imports has the
 NAR hash the narinfo names. Answering a narinfo fetches no NAR content. B's
-pack cache returns under its size limit whenever no request holds it above.
-A narrenhaus that is not yet in the Nix configuration says exactly what to
-add and where.
+pack cache returns under its size limit when no request holds it above and
+no reference made local is still kept for a request that gave up, which is
+15 minutes at most. A narrenhaus that is not yet in the Nix configuration
+says exactly what to add and where.
+
+*Changed by the revision after the review, and not yet confirmed by the
+owner: the sentence on the pack cache. As approved it read "B's pack cache
+returns under its size limit whenever no request holds it above." The
+packs of a reference that was made local are now kept for the request that
+gave up waiting for them; section 2.3, entry 26, has the decision and its
+reason.*
 
 ## 2. Decisions
 
@@ -139,8 +150,12 @@ the owner's split into two references and are not listed.
 
 Each is the designer's call and may be overruled. Entries 1 to 22 stood
 when the owner approved the document. Entries 23 to 33 were added by the
-revision after the review of the built program, each with its reason; the
-owner has not yet confirmed them.
+revision after the review of the built program, each with its reason.
+Entries 34 to 45 were added when the revised document was checked against
+the code: 34 to 39 are calls the revision had put into the body without an
+entry here, and 40 to 45 are calls the program had before the review that
+this list did not name. The same check corrected what entry 24 says a
+check costs. The owner has not yet confirmed any of entries 23 to 45.
 
 1. **Names of the two references.** The prefix followed by the path Nix
    asks for: `<prefix><store hash>.narinfo` and
@@ -208,10 +223,19 @@ owner has not yet confirmed them.
     and read what the cache serves.
 24. **A NAR has at most 64 GiB.** A longer one is refused at upload, and a
     reference whose recipe states more is broken (sections 5.1, 6.3).
-    Checking a reference costs the hashing of its NAR and anyone may write
-    a reference, so without a bound one reference could cost every laptop
+    Checking a reference means rebuilding its NAR and anyone may write a
+    reference, so without a bound one reference could cost every laptop
     that asks for it any amount of work; the upload has the same bound so
-    that a NAR one laptop takes is one every other can check.
+    that a NAR one laptop takes is one every other can check. What the
+    bound bounds is the bytes a check writes, 64 GiB, and not its work:
+    each byte written may cost the reading and the key check of one object
+    per level of the index it is reached through, and an index may have 64
+    levels. A reference built to be costly can so cost a large multiple of
+    the hashing of 64 GiB (sections 6.3, 12). It takes a reference built
+    for it: one that narrenhaus writes holds a file in chunks of up to
+    1 MiB, of at least 32 KiB each but for the last, under an index of few
+    levels. The program is left as it is, because those who can write a
+    reference are trusted (section 2.1).
 25. **Every object read from the cache is checked against its key** before
     it goes out in a NAR or, as part of a narinfo, under the laptop's
     signature (sections 6.2, 6.3). The cache syncs nothing and takes a
@@ -263,6 +287,77 @@ owner has not yet confirmed them.
     that variable is set Nix reads the files it names and not
     `~/.config/nix/nix.conf`, so advice that names the default file would
     send the user to a file Nix does not read.
+34. **The packs of a narinfo announce at most 1024 objects each, and its
+    text is read from at most 1024 objects** (section 6.2 steps 3 and 4);
+    a reference beyond either is broken. The bound of 4 MiB counts the
+    bytes of objects and not the index, which is read whole into memory
+    before any object: objects may be empty, and a pack of 2^24 of them
+    announces next to nothing. The chunker cuts 1 MiB into some thirty
+    chunks at most, so an index that names more than 1024 objects was
+    built to keep its reader busy.
+35. **A tree in a form that core's builders do not make is broken**: a
+    FileNode with a child of no bytes, a DirNode without a child, a DirNode
+    with a DirLeaf that has no entry as a child, and an index of more than
+    64 levels (section 6.3 step 2). An index may name one object any
+    number of times, so one that names an empty object could keep its
+    reader at work without end and without a byte written. With the rule
+    every child gives the NAR a byte or an entry at least, and the work is
+    bounded by the bytes written times the levels (entry 24).
+36. **The verdict "broken" is passed only on packs that came from the
+    server for the work that passes it, and it takes only the reference's
+    own pack out of the cache** (section 6.4). Packs that were in the
+    cache may have suffered there, so when a reference looks broken they
+    are dropped and fetched again first, in at most three rounds, after
+    which the work ends with a 404 and no verdict. The parent pack is not
+    dropped with a broken reference: it was checked object by object when
+    it came, and it is the base of other references. The cost: a parent
+    that was in the cache is downloaded once more before the verdict, and
+    its own reference is checked again (sections 6.4, 12).
+37. **A NAR beyond a limit is answered 422, not 507** (section 5.1): one
+    of more than 64 GiB, and one that a pack cannot hold. 507 says that a
+    write failed, and Nix repeats a request that got 5xx; no repeat cures
+    a limit, and the body is to name it.
+38. **How `serve` stops** (section 10). Requests that were cut are waited
+    for five seconds more; the uploader, the store and the cache are closed
+    only when no request runs; if one still runs after the five seconds,
+    `serve` returns without closing them; an upload that is being staged
+    when the work stops answers 502. A request reads the cache and the
+    store and writes through the uploader until it ends, so they are
+    closed after the requests and, where a request will not end, not at
+    all: the process is ending, and its end gives up the cache directory
+    and the connections.
+39. **A setting whose value is `null` counts as output that cannot be
+    read** (section 8 step 6). A null reads as an empty list or as `false`
+    without an error, and the check would then give advice on a setting
+    it had not seen.
+40. **A narinfo is taken only where narrenhaus reads it as Nix does, and
+    one that is served is held to the same parse as one that is uploaded**
+    (sections 5.3 step 1, 6.2 step 4). Under first writer wins a narinfo
+    that Nix reads otherwise than narrenhaus, or refuses, would stay on
+    the server for everyone. The cost: a narinfo already on a server that
+    fails a rule of the parse, among them the rule of entry 29, which the
+    revision added, is a broken reference on every laptop until someone
+    deletes it (section 12).
+41. **A cache directory is one narrenhaus's at a time** (section 7.1). A
+    start takes a lock in the directory and refuses a directory that
+    another narrenhaus has open. A start removes unfinished packs and
+    empties `staging/` and `tmp/`, which under a running narrenhaus is the
+    work it has in hand, and two processes would each evict by a table of
+    its own.
+42. **At most eight content references are checked at once**, as many as
+    content packs are downloaded (section 6.3 step 2). Walking a large
+    tree and rebuilding its NAR takes a processor for a while.
+43. **All runs of `nix` in one setup check share a limit of 20 seconds**
+    (section 8 step 1), so that a Nix daemon that does not answer cannot
+    keep `serve` from starting.
+44. **`serve` looks once a minute for staged NARs whose time is over**
+    (section 5.1), so a staged NAR goes between 15 and 16 minutes after
+    the uploads fell idle, not at 15 minutes exactly.
+45. **A connection has 30 seconds to send the head of a request and is
+    closed after 5 minutes without one; nothing limits a body in either
+    direction** (section 6.4). A NAR takes as long as it is, and the
+    answer to a narinfo `PUT` waits for a push, so only what comes before
+    a request has a limit.
 
 ## 3. Goals, non-goals, anti-goals
 
@@ -551,8 +646,10 @@ gets 404 too.
 
 Staged NARs are deleted when 15 minutes have passed during which no upload
 request was being handled and no push was running or queued, and everything
-in staging is deleted at start. Age alone never deletes one. Deleting a
-staged NAR removes its entry.
+in staging is deleted at start. `serve` looks once a minute whether that
+time has passed, so a staged NAR goes between 15 and 16 minutes after the
+uploads fell idle. Age alone never deletes one. Deleting a staged NAR
+removes its entry.
 
 ### 5.2 The narinfo as stored
 
@@ -581,9 +678,34 @@ In order:
 1. Parse. The hash in the URL must be the hash part of `StorePath`,
    `StorePath` must be under `/nix/store`, `NarHash` must be a SHA-256,
    the stored text must not exceed 1 MiB, and the body must be plain text
-   (a `Content-Encoding` header is 415); otherwise 400. A `CA` line that
-   is not empty must be a content address Nix 2.35.4 reads and can check a
-   path with: `text:sha256:<digest>` or
+   (a `Content-Encoding` header is 415); otherwise 400. The parse takes no
+   text that Nix would read otherwise than narrenhaus does, and so it
+   refuses more, each with 400:
+   - a body of more than 1 MiB;
+   - a line that does not end in a line feed, the last one included;
+   - a line that is not `Key: value`, which is a key that is not empty, a
+     colon, one space and the value, which may be empty. An empty line is
+     no such line. A line of this form with a key narrenhaus does not know
+     is ignored;
+   - a text without `StorePath` or without `NarHash`, and a `NarSize` that
+     is missing, zero, not decimal digits alone, or beyond 64 bits;
+   - a `StorePath` that is not `/nix/store/` and then a store path's name
+     as Nix allows one: 32 characters of Nix's base 32, a dash, and a name
+     of 1 to 211 characters out of letters, digits and `+-._?=`, which is
+     neither `.` nor `..` and begins with neither `.-` nor `..-`;
+   - a name in `References` that is no such name (the names are parted by
+     spaces), and a `Deriver` that is neither such a name nor
+     `unknown-deriver`, which is stored as no deriver;
+   - a `NarHash` that is not `sha256:` and 52 characters of Nix's base 32
+     or 64 of base 16, or `sha256-` and the base 64 of 32 bytes;
+   - a `Sig` that is not a key's name that is not empty, a colon and the
+     base 64 of 64 bytes;
+   - a second `References` line and a second `CA` line. Of any other key
+     given twice the last one counts, as for Nix;
+   - a `CA` line that the following rule refuses.
+
+   A `CA` line that is not empty must be a content address Nix 2.35.4
+   reads and can check a path with: `text:sha256:<digest>` or
    `fixed:[r:|git:]<algorithm>:<digest>`, the algorithm one of md5, sha1,
    sha256, sha512 and blake3 (after `git:` only sha1 or sha256), the
    digest in base 16, Nix's base 32 or base 64. A text address must not
@@ -594,6 +716,18 @@ In order:
    although a Nix without the experimental features `git-hashing` and
    `blake3-hashes` refuses the whole narinfo, which stays so for
    colleagues without the feature.
+
+   A narinfo that is served is held to this same parse (section 6.2
+   step 4). narrenhaus stores only what it has parsed, so what it wrote
+   passes the rules it had when it wrote. A rule that came later is
+   another matter, and the rule on content addresses is one: before the
+   revision after the review, any `CA` of printable characters without a
+   space was taken. A narinfo already on a server that fails a rule,
+   written by a narrenhaus from before the rule or by something else, is
+   a broken reference on every laptop that has the rule: 404, an error in
+   the log, and no cure in a new upload, which first writer wins answers
+   200 without writing. It stays so until someone deletes the reference
+   (section 12).
 2. Make sure the content for `NarHash` is on the server.
    - An entry that is queued or running: mark it as asked for by a narinfo
      and wait for it.
@@ -670,9 +804,13 @@ Priority: <priority>
    a few dozen bytes and a data object about the size of the narinfo. Read
    the text with `fstree.WriteContent`, from at most 1024 objects, each
    checked against its key, also when the pack was cached before. The text
-   must parse as an upload's must (section 5.3 step 1), its `StorePath`
-   must have the hash `<H>`, its `URL` must be `nar/<its NarHash>.nar` and
-   its `Compression` `none`; otherwise the reference is broken. Write the
+   must parse as an upload's must, by every rule that section 5.3 step 1
+   lists for the text, its `StorePath` must have the hash `<H>`, its `URL`
+   must be `nar/<its NarHash>.nar` and its `Compression` `none`; otherwise
+   the reference is broken. That holds as well for a narinfo that was put
+   on the server before a rule of the parse existed (the rule on content
+   addresses came with the revision): it is broken on every laptop until
+   it is deleted by hand (sections 5.3 step 1, 12). Write the
    record. An object of a cached pack that does not match its key is a
    damaged cache and no broken reference (section 6.4): the answer is 404,
    nothing is signed, the pack is dropped and the next request fetches it.
@@ -701,21 +839,44 @@ not looked at.
    the recipe's `narHash` and `narSize` (a difference is broken). A recipe
    that states a `narSize` above 64 GiB is broken without a rebuild, and a
    rebuild stops at the first byte beyond `narSize`, so the check of any
-   reference, however it was built, costs no more than the hashing of
-   64 GiB. A tree in which a FileNode has a child of no bytes, a DirNode
-   has no child, or a DirNode has a DirLeaf without an entry as a child is
-   broken: core's builders make none of these, and such an index could
-   otherwise name one object any number of times and keep its reader at
-   work for nothing. Every object read for the check is checked against
-   its key. The check runs under the process's context like the download,
-   later requests join it, and its result is the "checked" mark in the
-   record. A pack placed by a local upload passed it in step 6 of
-   section 5.1.
+   reference, however it was built, writes no more than 64 GiB of NAR. A
+   tree in which a FileNode has a child of no bytes, a DirNode has no
+   child, or a DirNode has a DirLeaf without an entry as a child is
+   broken, and so is one whose index of a file or of a directory has more
+   than 64 levels: core's builders make none of these, and such an index
+   could otherwise name one object any number of times and keep its
+   reader at work for nothing. Every object read for the check is checked
+   against its key.
+
+   These rules bound the bytes a check writes and not its work. An index
+   may still name one small object again and again, and each time it is
+   read and checked against its key anew, so each byte written may cost
+   the reading and the key check of one object for every level of the
+   index it is reached through. A reference built to be costly, a file of
+   one-byte chunks under a deep index, can so cost a large multiple of
+   the hashing of its NAR, for up to 64 GiB of it, and its check holds a
+   place among the checks for that time. This is accepted, because those
+   who can write a reference are trusted (section 2.1); section 12 lists
+   it.
+
+   At most eight content references are walked and checked at once, as
+   many as content packs are downloaded; the others wait. The check runs
+   under the process's context like the download, later requests join it,
+   and its result is the "checked" mark in the record. A pack placed by a
+   local upload passed it in step 6 of section 5.1.
 3. Send `Content-Length: <narSize>`, `Content-Type: application/x-nix-nar`,
    then the NAR, written by walking the `nar` entry: directory entries in
    stored order, a file's length from its content key (`key.Length()`), its
-   bytes with `fstree.WriteContent`. No `Accept-Ranges`. Each object is
-   checked against its key before its bytes are sent; one that fails is a
+   bytes by a writer of narrenhaus's own, the one the check of step 2
+   rebuilds with. It does what core's `fstree.WriteContent` does and
+   checks the lengths on the way down: a Blob must have the length its key
+   states and a FileNode the sum of its children's, so a file that would
+   come out longer or shorter than its key says is refused where the
+   difference is, before the bytes in question are written; the forms
+   step 2 refuses are refused here as well. No `Accept-Ranges`. Each
+   object is checked against its key before its bytes are sent, each time
+   the tree names it, so a NAR that was costly to check (step 2) is as
+   costly to send; one that fails is a
    damaged cache (section 6.4), and what was sent until then is right and
    is not the whole NAR. If an object fails so, or if the bytes written
    would differ from a file's stated length or from `narSize`, the writer
@@ -758,11 +919,11 @@ and says why.
   a recipe that states more than 64 GiB, or a NAR that does not match its
   recipe and name. It is 404 to Nix and an error in the log, and its own
   pack is dropped from the cache if it was fetched for it. Its parent pack
-  stays: it was checked object by object when it came, and it is the base
-  of other references. The process remembers the name and root, so later
-  requests that find the same root there are answered 404 without
-  downloading again. narrenhaus does not replace a broken reference
-  (section 12).
+  is not dropped with the verdict: it was checked object by object when it
+  came, and it is the base of other references. The process remembers the
+  name and root, so later requests that find the same root there are
+  answered 404 without downloading again. narrenhaus does not replace a
+  broken reference (section 12).
 
   The verdict is passed only on packs that came from the server for this
   piece of work. If a reference looks broken and one of its packs came
@@ -770,6 +931,29 @@ and says why.
   verdict is passed on what comes then, by the same work and for the same
   request. A pack that the work of another reference drops meanwhile is
   fetched again in the same way.
+
+  The work goes through the packs of its reference in at most three
+  rounds: as it finds them, once more after it has dropped those that
+  came from the cache, and once more for a pack that the work of another
+  reference dropped meanwhile. If the third round, too, ends with a pack
+  gone or with the reference looking broken on packs that did not come
+  for this work, the work ends without a verdict: the request is answered
+  404, the cause is logged as a warning, nothing is remembered against
+  the reference, and the next request begins the work anew. A request
+  that comes out of the work and finds a pack of its reference gone has
+  the work done again; the third time it finds one gone it is answered
+  404, and nothing is remembered then either.
+
+  The deferred verdict has a cost. The cached packs that are dropped
+  before it include the parent pack, when that was in the cache: it is
+  downloaded once more, whole, although it was sound. The records of the
+  references whose root it is go with it, so a reference that is the
+  parent's own has lost its "checked" mark and has its tree walked and
+  its NAR rebuilt again at its next request. Anyone who can write a
+  reference can so cost a laptop one more download of a base pack and one
+  more check, by a broken patch on a base the laptop has cached: once for
+  each such reference and each run of the process, because the verdict is
+  remembered from then on (section 12).
 - **Damaged cache.** An object of a cached pack that does not match its
   key when it is read (section 7.1) is the disk's doing and no broken
   reference. The pack is dropped and nothing is remembered against the
@@ -785,6 +969,10 @@ and says why.
   by the name it was given, and sends neither header. A refused `PUT` is
   answered 403 with the reason and anything else 404, before the path is
   looked at or a body read, and the refusal is logged as a warning.
+- **Connections.** A connection has 30 seconds to send the head of a
+  request, and one on which no request has come for 5 minutes is closed.
+  Nothing limits a body in either direction: a NAR takes as long as it
+  is, and the answer to a narinfo `PUT` waits for a push.
 - Every other path is 404.
 
 ## 7. Pack cache
@@ -794,6 +982,7 @@ and says why.
 Default directory: `<os.UserCacheDir()>/narrenhaus`.
 
 ```
+lock                      empty; locked by the narrenhaus that has the directory open
 origin                    the server's endpoint ID and the prefix
 packs/<root hex>.idx      jaccard-store index (packfile.Index encoding)
 packs/<root hex>.data     the pack's objects, uncompressed, at the index's offsets
@@ -815,6 +1004,14 @@ tmp/                      downloads and packs being built
 - Files are written under `tmp/` and renamed into place; `.meta` goes last
   and marks the pack valid. At start, packs without `.meta` and everything
   under `tmp/` and `staging/` are removed.
+- `lock` makes a cache directory one narrenhaus's at a time. A start
+  takes the system's advisory lock on the file (`flock`), without waiting
+  for it and before it changes anything else in the directory, and keeps
+  it until the cache is closed or the process ends; the file itself
+  stays. A directory that another narrenhaus has open is refused at
+  start, named in the error and left as it was, because a start removes
+  what it takes for unfinished, and that is the work the other has in
+  hand.
 - `origin` is written on first use. If it names another server or prefix,
   narrenhaus refuses to start and names the directory and both values. A
   directory without an `origin` is taken for a new cache only if it is
@@ -898,7 +1095,11 @@ Run at the start of `serve` (which then serves regardless) and by `check`
    failing command means not trusted. For a user it does not trust, read
    the configuration again as the daemon sees it: the same command with
    `NIX_USER_CONF_FILES` set to the empty string and `NIX_CONFIG` removed
-   from the environment.
+   from the environment. All runs of `nix` in one check share a limit of
+   20 seconds, so that a Nix daemon that does not answer cannot keep
+   `serve` from starting. A run that the limit cuts is a run that failed:
+   for the configuration that is step 6, and for the question of trust it
+   means not trusted.
 2. Configured means all of:
    - `substituters` has an entry equal to narrenhaus's URL after dropping a
      trailing slash and any `?parameters`. The URL is `http://` plus the
@@ -1196,6 +1397,25 @@ without waiting for requests or work, however the process was started.
   upload is refused (422), and a reference whose recipe states a longer
   NAR is broken. An upload is refused as well (422) when its NAR comes
   apart into more than 2^24 objects.
+- **The limit of 64 GiB bounds the bytes of a check, not its work.** A
+  check writes at most 64 GiB of NAR, but each byte written may cost the
+  reading and the key check of one object for every level of the index it
+  is reached through, up to 64. A reference built for it, a file of
+  one-byte chunks under a deep index, which takes only a few small
+  objects, can cost a laptop that asks for it a large multiple of the
+  hashing of the NAR its recipe states. It holds one of the eight places
+  for checks for that time, and costs as much again each time its NAR is
+  sent. The program does not bound this further. It is accepted because
+  those who can write a reference are trusted (sections 2.1, 6.3).
+- **A broken patch costs a laptop its cached base pack once.** When a
+  reference looks broken and its parent pack was in the cache, the parent
+  is dropped and downloaded again before the verdict is passed, and the
+  reference whose own pack the parent is has its NAR checked again at its
+  next request. This happens once for each broken reference and each run
+  of the process, and anyone who can write a reference can cause it
+  (section 6.4). A reference that still looks broken on cached packs
+  after three rounds is answered 404 without a verdict, and the next
+  request begins again.
 - A compressed upload that makes its reader hold more memory than those
   of Nix do, an xz dictionary above 64 MiB or a zstd window above 128 MiB,
   is refused (400).
@@ -1219,6 +1439,12 @@ without waiting for requests or work, however the process was started.
   although a Nix without the experimental features `git-hashing` and
   `blake3-hashes` refuses the whole narinfo; under first writer wins the
   path stays of use only to colleagues who have the feature on.
+- A narinfo is served only if it passes the parse an upload must pass
+  (section 5.3 step 1). One that is on the server already and fails a
+  rule of it, for instance one stored before the rule on content
+  addresses existed, is a broken reference on every laptop: its path is
+  not substitutable from narrenhaus, and a new upload does not replace
+  it, until someone deletes the reference.
 - Where `NIX_USER_CONF_FILES` is set and names no file, Nix reads no
   configuration file of the user's, and the advice can only say so beside
   the lines (section 8).
@@ -1315,7 +1541,10 @@ without waiting for requests or work, however the process was started.
   upload cut off at its next object when the uploader is closed.
 - **Defaults**: the time limits, and the numbers of things done at once,
   that the program takes when nothing is configured are compared with
-  this document by tests of the packages that hold them.
+  this document by tests of the packages that hold them, the eight checks
+  at once, the 20 seconds of the setup check and the sweep of staging
+  once a minute among them. The two limits of a connection (section 6.4,
+  30 seconds and 5 minutes) are the exception: no test compares them.
 - **End to end without network**: an in-process jaccard-store server over
   loopback iroh with an in-memory bucket, as jaccard-store's `e2e` and
   jaccard-nfs-nix-store's `jstest` set one up. Two narrenhaus instances
