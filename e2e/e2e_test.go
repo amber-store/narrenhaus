@@ -223,8 +223,9 @@ func TestConnectionKilledBetweenRequests(t *testing.T) {
 	h.a.settled()
 
 	h.b.narinfoOf(one)
-	// The server ends every connection, as a restart of it or a sleep of
-	// the laptop does. b learns of it only when it next asks.
+	// The server closes every connection and tells its clients so, as one
+	// that is stopped in good order does. A connection lost without a
+	// word, as while the laptop sleeps, is another case, and not this one.
 	h.srv.DropConnections()
 	// The next request is for a path b has nothing of: only the server
 	// can have answered it.
@@ -289,6 +290,9 @@ func TestServerDownAnswers(t *testing.T) {
 	if answer.err != nil {
 		t.Error(answer.err)
 	}
+	// In time for Nix. This is not the 10 seconds a lookup may take: the
+	// dial of a server that is not there is given up before that, and the
+	// limit itself is held by the tests of remote.
 	if answer.took > 11*time.Second {
 		t.Errorf("b answered the narinfo after %s, want a 404 within 11s", answer.took)
 	}

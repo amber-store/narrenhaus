@@ -29,8 +29,9 @@ import (
 // Nix remembers what a cache URL answered, per user account, under
 // XDG_CACHE_HOME. So every test gives nix a directory of its own for that
 // and store paths nobody has seen: directories of random bytes, added to
-// this machine's store with `nix store add` and deleted from it again at
-// the test's end where the store allows it. The user's Nix configuration is
+// this machine's store with `nix store add`, and in one test derivations
+// of one line that are built there, all deleted from it again at the
+// test's end where the store allows it. The user's Nix configuration is
 // left out (NIX_USER_CONF_FILES empty, NIX_CONFIG unset); nothing of the
 // machine's configuration is changed, every setting a test needs is on
 // nix's command line.
@@ -508,11 +509,14 @@ func stoppableFront(t *testing.T, i *instance) *stoppable {
 	return &stoppable{url: "http://" + ln.Addr().String(), stop: func() { srv.Close() }}
 }
 
-// The case of the design's section 8.1, as far as it can be run without a
-// build: Nix has a narrenhaus among its substituters that it has talked to
-// before and that is not running now, and fallback = true as the advice
-// asks. A substitution of a path another cache has must still succeed, and
-// Nix must have tried the stopped one.
+// The case of the design's section 8.1 for a substitution: Nix has a
+// narrenhaus among its substituters that it has talked to before and that
+// is not running now, and fallback = true as the advice asks. A
+// substitution of a path another cache has must still succeed, and Nix
+// must have tried the stopped one. Whether Nix fails here without fallback
+// depends on its version and on the order it asks the caches in, and is
+// only noted; TestBuildWithStoppedNarrenhausNeedsFallback is the case in
+// which it must.
 //
 // The other cache is instance b; the narrenhaus that is stopped is a front
 // before instance a. The store is a throwaway one, so the substituters are
@@ -569,5 +573,103 @@ func TestStoppedNarrenhausWithFallback(t *testing.T) {
 	store.holds(p)
 	if !strings.Contains(stderr, front.url) {
 		t.Errorf("Nix did not try the stopped narrenhaus at %s:\n%s", front.url, stderr)
+	}
+}
+
+// building is a derivation nobody has built: its output is a path that
+// only a cache could have, and no cache has.
+type building struct {
+	nix   *nix
+	token string
+	expr  string
+}
+
+// derivation makes a derivation of this machine's store whose build writes
+// a text nobody has seen into its output. The test's end deletes it.
+func (n *nix) derivation() *building {
+	n.t.Helper()
+	b := &building{nix: n, token: token(n.t)}
+	b.expr = fmt.Sprintf(`derivation { name = "narrenhaus-test-built"; system = builtins.currentSystem; `+
+		`builder = "/bin/sh"; args = [ "-c" "echo %s > $out" ]; }`, b.token)
+	drv, _ := n.must("eval", "--impure", "--raw", "--expr", "("+b.expr+").drvPath")
+	if !strings.HasPrefix(drv, "/nix/store/") || !strings.HasSuffix(drv, ".drv") {
+		n.t.Fatalf("nix eval printed %q", drv)
+	}
+	n.deleteAtEnd(drv)
+	return b
+}
+
+// build builds the derivation with the machine's store, with substituter
+// as the one cache to ask, and returns the output's path.
+func (b *building) build(substituter, fallback string) (out, stderr string, err error) {
+	out, stderr, err = b.nix.run("build", "--no-link", "--print-out-paths", "--impure",
+		"--option", "substituters", substituter,
+		"--option", "fallback", fallback,
+		"--expr", b.expr)
+	if out = strings.TrimSpace(out); err == nil {
+		b.nix.deleteAtEnd(out)
+	}
+	return out, stderr, err
+}
+
+// The case of the design's section 8.1 as the design states it: narrenhaus
+// is among Nix's substituters, Nix has met it, and it is not running. A
+// build that needs a path only narrenhaus could have fails without
+// fallback = true and succeeds with it, which is why the advice asks for
+// the line.
+//
+// The builds are the machine's, so they go through its Nix daemon where
+// there is one, and a daemon takes substituters only from a user it
+// trusts: where it does not ask the narrenhaus of the test, the test
+// skips. Nothing of the machine's configuration is changed; what stays is
+// what the daemon remembers of a cache at a port of loopback.
+func TestBuildWithStoppedNarrenhausNeedsFallback(t *testing.T) {
+	nix := newNix(t)
+	h := start(t, testserver.Options{})
+	front := stoppableFront(t, h.a)
+	user := nix.forgetful()
+
+	// Nix meets the narrenhaus while it runs: asked for the output of a
+	// build, it has nothing, and Nix builds.
+	mark := len(h.a.log.String())
+	met := user.derivation()
+	out, stderr, err := met.build(front.url, "false")
+	if err != nil {
+		t.Fatalf("a build with a running narrenhaus as the substituter: %v\n%s", err, stderr)
+	}
+	asked := h.a.requests(mark)
+	if count(asked, "GET /nix-cache-info", " 200") == 0 {
+		t.Skipf("this Nix does not ask the substituters its user names (the daemon does not trust the user):\n%s", stderr)
+	}
+	if want := "GET /" + base(out)[:32] + ".narinfo 404"; !slices.Contains(asked, want) {
+		t.Fatalf("Nix did not ask the narrenhaus for the output of its build, want %s:\n%s", want, strings.Join(asked, "\n"))
+	}
+
+	front.stop()
+	if conn, err := net.DialTimeout("tcp", strings.TrimPrefix(front.url, "http://"), time.Second); err == nil {
+		conn.Close()
+		t.Fatalf("the stopped narrenhaus still listens at %s", front.url)
+	}
+
+	// Without fallback the build fails on the cache that does not answer.
+	without := user.derivation()
+	out, stderr, err = without.build(front.url, "false")
+	if err == nil {
+		t.Errorf("with a stopped narrenhaus as the substituter and fallback = false Nix built %s:\n%s", out, stderr)
+	} else if !strings.Contains(stderr, front.url) {
+		t.Errorf("without fallback Nix failed for another reason than the stopped narrenhaus at %s:\n%s", front.url, stderr)
+	}
+
+	// With it Nix says that the cache failed and builds.
+	with := user.derivation()
+	out, stderr, err = with.build(front.url, "true")
+	if err != nil {
+		t.Fatalf("with a stopped narrenhaus as the substituter and fallback = true Nix failed: %v\n%s", err, stderr)
+	}
+	if !strings.Contains(stderr, front.url) {
+		t.Errorf("Nix did not try the stopped narrenhaus at %s:\n%s", front.url, stderr)
+	}
+	if got, err := os.ReadFile(out); err != nil || strings.TrimSpace(string(got)) != with.token {
+		t.Errorf("the output %s of the build with fallback holds %q, %v, want %s", out, got, err, with.token)
 	}
 }
