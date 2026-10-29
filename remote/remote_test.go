@@ -1309,6 +1309,74 @@ func TestClose(t *testing.T) {
 	})
 }
 
+func TestCloseAndTheIdleBucketConnections(t *testing.T) {
+	// A bucket that tells how many connections to it are open.
+	var mu sync.Mutex
+	open, opened := 0, 0
+	bucket := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "a pack")
+	}))
+	bucket.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch state {
+		case http.StateNew:
+			open++
+			opened++
+		case http.StateClosed:
+			open--
+		}
+	}
+	bucket.Start()
+	defer bucket.Close()
+	counts := func() (int, int) {
+		mu.Lock()
+		defer mu.Unlock()
+		return open, opened
+	}
+	// get makes a transfer and leaves its connection idle.
+	get := func(t *testing.T, hc *http.Client) {
+		t.Helper()
+		res, err := hc.Get(bucket.URL)
+		if err != nil {
+			t.Fatalf("GET: %v", err)
+		}
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+		if now, _ := counts(); now != 1 {
+			t.Fatalf("%d connections to the bucket after a transfer, want 1", now)
+		}
+	}
+
+	t.Run("of the Remote's own client are closed", func(t *testing.T) {
+		r := remote.New(remote.Config{Log: quiet})
+		defer r.Close()
+		get(t, remote.HTTPClient(r))
+
+		r.Close()
+		eventually(t, "the idle connection to the bucket is closed", func() bool {
+			now, _ := counts()
+			return now == 0
+		})
+	})
+
+	t.Run("of the caller's client are left alone", func(t *testing.T) {
+		hc := &http.Client{Transport: &http.Transport{}}
+		defer hc.CloseIdleConnections()
+		_, before := counts()
+		r := remote.New(remote.Config{Log: quiet, HTTP: hc})
+		defer r.Close()
+		get(t, remote.HTTPClient(r))
+
+		r.Close()
+		// The client is still the caller's to use, on the connection it has.
+		get(t, hc)
+		if _, after := counts(); after != before+1 {
+			t.Fatalf("%d connections were opened to the bucket, want 1: Close took the caller's idle one", after-before)
+		}
+	})
+}
+
 func TestStalledTransferFails(t *testing.T) {
 	const limit = 300 * time.Millisecond
 

@@ -96,8 +96,10 @@ var errClosed = errors.New("the remote is closed")
 // Remote is the shared connection to the server. It is safe for
 // concurrent use.
 type Remote struct {
-	dial          func(ctx context.Context) (Conn, error)
-	http          *http.Client
+	dial func(ctx context.Context) (Conn, error)
+	http *http.Client
+	// ownHTTP: the HTTP client is the one New made, and no caller's.
+	ownHTTP       bool
 	lookupTimeout time.Duration
 	repeatAfter   time.Duration
 	dialTimeout   time.Duration
@@ -156,7 +158,7 @@ func New(cfg Config) *Remote {
 		r.dial = func(context.Context) (Conn, error) { return nil, errors.New("remote: no Dial was configured") }
 	}
 	if r.http == nil {
-		r.http = newHTTPClient(stallLimit)
+		r.http, r.ownHTTP = newHTTPClient(stallLimit), true
 	}
 	if r.lookupTimeout <= 0 {
 		r.lookupTimeout = defaultLookupTimeout
@@ -189,6 +191,10 @@ func (noServer) OpenStreamConn(context.Context) (net.Conn, error) {
 // Close ends the dial under way and retires the connection: it is closed
 // now if no call runs on it, and otherwise when the last of them returns.
 // Calls made after Close fail with ErrUnreachable.
+//
+// The idle connections to the bucket are closed as well if the HTTP client
+// is the Remote's own; a caller's client is left as it is. A transfer
+// under way goes on, and its connection is the HTTP client's to drop.
 func (r *Remote) Close() {
 	r.mu.Lock()
 	if r.closed {
@@ -207,6 +213,9 @@ func (r *Remote) Close() {
 	r.cancel()
 	if idle {
 		r.closeLink(l)
+	}
+	if r.ownHTTP {
+		r.http.CloseIdleConnections()
 	}
 }
 

@@ -78,6 +78,14 @@ func (t *stallTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return res, nil
 }
 
+// CloseIdleConnections closes the idle connections of base: it is what
+// http.Client.CloseIdleConnections looks for in its transport.
+func (t *stallTransport) CloseIdleConnections() {
+	if base, ok := t.base.(interface{ CloseIdleConnections() }); ok {
+		base.CloseIdleConnections()
+	}
+}
+
 // watch runs stall when it has been armed for limit without being armed
 // again or put to rest.
 type watch struct {

@@ -14,6 +14,11 @@ func SetStallLimit(t testing.TB, limit time.Duration) {
 	t.Cleanup(func() { stallLimit = old })
 }
 
+// HTTPClient is the HTTP client the bucket transfers of r go through.
+func HTTPClient(r *Remote) *http.Client {
+	return r.http
+}
+
 // NewHTTPClient is the default HTTP client with a stall limit of its own.
 func NewHTTPClient(limit time.Duration) *http.Client {
 	return newHTTPClient(limit)
