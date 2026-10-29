@@ -203,8 +203,12 @@ func Open(dir string, limit uint64, origin Origin) (*Cache, error) {
 // hold nothing but what an Open leaves that ended before it wrote the
 // origin. That is the lock, the four directories, and in them the probe
 // of makeDir and, under tmp/, the file the origin is written to.
+//
+// An origin is there when checkOrigin will find one to read, so a link is
+// followed here as it is there: a link of that name that leads nowhere is
+// no origin, and one more name the directory may not hold.
 func checkNew(dir string) error {
-	if _, err := os.Lstat(filepath.Join(dir, originName)); err == nil {
+	if _, err := os.Stat(filepath.Join(dir, originName)); err == nil {
 		return nil
 	}
 	foreign := func(name string) error {

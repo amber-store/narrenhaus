@@ -2362,6 +2362,11 @@ func TestPackDroppedUnderAReferenceIsFetchedAgain(t *testing.T) {
 		if n := f.bucket.gets(".data", v1.root); n != 2 {
 			t.Errorf("%d downloads of the parent, want the one that was dropped and one more", n)
 		}
+		// The round that follows the one in which the parent was found
+		// gone does not hash the archive again.
+		if n := f.log.count("rebuilding the archive", f.store.ContentName(x.hash)); n != 1 {
+			t.Errorf("the archive was rebuilt %d times, want once", n)
+		}
 	})
 	t.Run("its own pack", func(t *testing.T) {
 		f := newFixture(t, config{})
@@ -2391,6 +2396,9 @@ func TestPackDroppedUnderAReferenceIsFetchedAgain(t *testing.T) {
 		}
 		if n := f.bucket.gets(".data", v1.root); n != 1 {
 			t.Errorf("%d downloads of the pack that was dropped, want one", n)
+		}
+		if n := f.log.count("rebuilding the archive", f.store.ContentName(v1.hash)); n != 1 {
+			t.Errorf("the archive was rebuilt %d times, want once", n)
 		}
 	})
 }
@@ -2507,6 +2515,19 @@ func TestAlteredCacheIsNotServed(t *testing.T) {
 		f.serves(v1)
 	})
 
+	// digit changes the first digit of the NarSize of a narinfo's text.
+	digit := func(data []byte) {
+		at := bytes.Index(data, []byte("NarSize: "))
+		if at < 0 {
+			t.Fatal("no NarSize in the pack")
+		}
+		if digit := &data[at+len("NarSize: ")]; *digit == '9' {
+			*digit = '8'
+		} else {
+			*digit++
+		}
+	}
+
 	t.Run("a digit of a narinfo", func(t *testing.T) {
 		f := newFixture(t, config{})
 		r := ingested(t, archive(t, smallTree(1)))
@@ -2516,17 +2537,7 @@ func TestAlteredCacheIsNotServed(t *testing.T) {
 		if _, err := f.store.Narinfo(background(t), hash); err != nil {
 			t.Fatal(err)
 		}
-		f.altered(info.root, func(data []byte) {
-			at := bytes.Index(data, []byte("NarSize: "))
-			if at < 0 {
-				t.Fatal("no NarSize in the pack")
-			}
-			if digit := &data[at+len("NarSize: ")]; *digit == '9' {
-				*digit = '8'
-			} else {
-				*digit++
-			}
-		})
+		f.altered(info.root, digit)
 		f.bucket.forget()
 
 		eventually(t, "the narinfo is served again", func() bool {
@@ -2545,6 +2556,36 @@ func TestAlteredCacheIsNotServed(t *testing.T) {
 		}
 		if !f.log.has("level=WARN", f.store.NarinfoName(hash)) {
 			t.Error("the altered pack is not in the log")
+		}
+	})
+
+	t.Run("a digit of a narinfo, with the server out of reach", func(t *testing.T) {
+		// Here the answer comes from the disk alone, and it is signed.
+		f := newFixture(t, config{})
+		r := ingested(t, archive(t, smallTree(1)))
+		hash := storeHash("one")
+		info := narinfoOf(t, hash, "one", r)
+		f.pushNarinfo(info)
+		if _, err := f.store.Narinfo(background(t), hash); err != nil {
+			t.Fatal(err)
+		}
+		f.altered(info.root, digit)
+		f.srv.Stop()
+
+		got, err := f.store.Narinfo(background(t), hash)
+		if err == nil {
+			t.Fatalf("an altered narinfo was answered from the cache with the server down, with NarSize %d for %d", got.NarSize, r.size)
+		}
+		notFound(t, "Narinfo from an altered pack, with the server down", err)
+		if !f.log.has("level=WARN", f.store.NarinfoName(hash)) {
+			t.Error("the altered pack is not in the log")
+		}
+		if _, ok := f.cache.Meta(info.root); ok {
+			t.Error("the altered pack is still in the cache")
+		}
+		// Nothing is left to answer from, for the question either.
+		if ok, err := f.store.HasNarinfo(background(t), hash); ok || err != nil {
+			t.Errorf("HasNarinfo after the altered pack was dropped = %v, %v, want false", ok, err)
 		}
 	})
 }

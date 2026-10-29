@@ -1449,6 +1449,25 @@ func TestOpenRefusesADirectoryThatIsNoCache(t *testing.T) {
 		return out
 	}
 
+	// refused opens dir, which must fail with ErrForeign and leave dir as
+	// it was.
+	refused := func(t *testing.T, dir string) {
+		t.Helper()
+		before := tree(t, dir)
+		c, err := Open(dir, roomy, testOrigin)
+		if err == nil {
+			c.Close()
+		}
+		if !errors.Is(err, ErrForeign) {
+			t.Errorf("Open: %v, want ErrForeign", err)
+		} else if !strings.Contains(err.Error(), dir) || strings.Contains(err.Error(), "\n") {
+			t.Errorf("the message %q does not name the directory %s on one line", err, dir)
+		}
+		if after := tree(t, dir); !slices.Equal(after, before) {
+			t.Errorf("the directory holds %q after the Open, it held %q", after, before)
+		}
+	}
+
 	for name, files := range map[string][]string{
 		"a home with tmp and staging":   {"tmp/work/thesis.txt", "staging/work/thesis.txt"},
 		"a file in tmp":                 {"tmp/thesis.txt"},
@@ -1465,22 +1484,20 @@ func TestOpenRefusesADirectoryThatIsNoCache(t *testing.T) {
 			for _, f := range files {
 				write(t, filepath.Join(dir, filepath.FromSlash(f)))
 			}
-			before := tree(t, dir)
-
-			c, err := Open(dir, roomy, testOrigin)
-			if err == nil {
-				c.Close()
-			}
-			if !errors.Is(err, ErrForeign) {
-				t.Errorf("Open: %v, want ErrForeign", err)
-			} else if !strings.Contains(err.Error(), dir) || strings.Contains(err.Error(), "\n") {
-				t.Errorf("the message %q does not name the directory %s on one line", err, dir)
-			}
-			if after := tree(t, dir); !slices.Equal(after, before) {
-				t.Errorf("the directory holds %q after the Open, it held %q", after, before)
-			}
+			refused(t, dir)
 		})
 	}
+
+	// A name is no origin: what tells a cache directory is an origin that
+	// can be read, and a link of that name that leads nowhere is none.
+	t.Run("a link named origin that leads nowhere", func(t *testing.T) {
+		dir := t.TempDir()
+		write(t, filepath.Join(dir, "tmp", "work", "thesis.txt"))
+		if err := os.Symlink(filepath.Join(dir, "no such file"), filepath.Join(dir, "origin")); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, dir)
+	})
 
 	// What an Open leaves that was killed before it wrote the origin is no
 	// reason to refuse the directory for ever.
@@ -1544,6 +1561,29 @@ func TestReservationKeepsAPackItHasNotRead(t *testing.T) {
 
 	h.Release()
 	wantNames(t, filepath.Join(dir, "tmp"))
+}
+
+// A reservation that was released follows its roots no longer: a pack
+// placed under one of them afterwards is not bound to it. Bound to a
+// reservation that is never released again, the pack's files would stay
+// under tmp/ when it is dropped, until the next Open.
+func TestReleasedReservationFollowsNothing(t *testing.T) {
+	dir := t.TempDir()
+	c := open(t, dir, roomy)
+	object := body("placed after the release", 3000)
+	root := blob(t, object)
+	c.Reserve(root).Release()
+	place(t, c, nil, object)
+
+	c.Drop(root)
+	wantNames(t, filepath.Join(dir, "packs"))
+	wantNames(t, filepath.Join(dir, "tmp"))
+	c.mu.Lock()
+	following := len(c.following)
+	c.mu.Unlock()
+	if following != 0 {
+		t.Errorf("%d roots are followed after the one reservation was released", following)
+	}
 }
 
 // A read through a reservation does not wait for the lock of the cache,
