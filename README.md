@@ -75,6 +75,10 @@ and `~/Library/Caches` on macOS; the configuration directory is `~/.config`
 - A cache directory belongs to one server and one prefix, and to one
   running narrenhaus. Started with another server or prefix, or while
   another narrenhaus has the directory, `serve` refuses and says why.
+- `--cache-dir` names a directory that is empty or not there yet, or one
+  that a narrenhaus made. `serve` empties `staging/` and `tmp/` in its
+  cache directory when it starts, so it refuses a directory that has files
+  in it and was not made by a narrenhaus, and leaves it as it was.
 - The cache holds the packs narrenhaus downloaded or uploaded, expanded.
   When it is over its size, the pack that has not been used for the longest
   time goes first. A pack a request is reading is never removed, so the
@@ -89,7 +93,9 @@ and `~/Library/Caches` on macOS; the configuration directory is `~/.config`
   port on loopback too. A request is answered only when it calls the cache
   by an IP address, by `localhost` or by the host of `--listen`, and an
   upload only when it carries no `Origin`, which a browser always sends
-  with one. So the substituter URL names the cache by its address, as the
+  with one. A request the browser marks as coming from another site
+  (`Sec-Fetch-Site`) is not answered either; the address typed into the
+  browser is. So the substituter URL names the cache by its address, as the
   advice prints it, or by the name `--listen` was given; under any other
   name an upload is refused (403) and nothing is found (404).
 
@@ -129,6 +135,11 @@ For a user the daemon does not trust, the substituter and the key count
 only in the system's files, because that is all the daemon honours.
 `fallback = true` may always go in `~/.config/nix/nix.conf`.
 
+Where `NIX_USER_CONF_FILES` is set, Nix reads the files it names in place
+of `~/.config/nix/nix.conf`, and the advice names the first of them. When
+the variable is set and names no file, Nix reads no file of the user's;
+the advice then says so beside the lines.
+
 **Why `fallback = true`.** narrenhaus is started by hand, so it is often
 not running. Nix that has a cache in its configuration which does not
 answer fails operations that need a path no other cache has, unless
@@ -151,7 +162,10 @@ after a successful copy a colleague can substitute it.
   compressing one first is work for nothing, and only without it can Nix
   ask whether the server already has a NAR and skip sending it. Without the
   parameter Nix compresses with xz; that works too, as do `zstd`, `gzip` and
-  `bzip2`. Anything else is refused (415).
+  `bzip2`. Anything else is refused (415). So is a compressed body that
+  makes its reader hold more memory than those of Nix do, an xz dictionary
+  above 64 MiB or a zstd window above 128 MiB (400).
+- A NAR of more than 64 GiB is refused (422).
 - A path already on the server is not pushed again: the first writer wins.
 - When the server cannot be reached, a copy fails at once (502) and says
   so. Substitution is different: there narrenhaus answers "not here" (404)
@@ -180,15 +194,21 @@ Disk and time
   server that verifies packs, every push also waits for the server's
   verification.
 - A substitution whose packs take more than 240 seconds to arrive is
-  answered "not here", and Nix builds the path or looks elsewhere although
-  the pack is ready shortly after.
+  answered "not here", and Nix builds the path or looks elsewhere. The
+  download goes on, and what it brought is kept for 15 minutes, whatever
+  the cache size, for the request that asks again.
+- **A NAR of more than 64 GiB can be neither uploaded nor served.** The
+  upload is refused, and a reference on the server that states a longer
+  NAR is treated as broken. An upload is refused as well (422) when its
+  NAR comes apart into more than 2^24 objects, which takes millions of
+  different files.
+- The first request after the machine slept can take about three seconds
+  longer. The connection to the server may have died without a word, and
+  narrenhaus waits that long for an answer on it before it dials again.
 - Fetching a path stored as a patch fetches its whole base pack, which can
   be as large as the path again.
 - Small packs cost more disk than the cache counts: a cached narinfo is
   four small files, each rounded up to a block of the file system.
-- An xz upload can make narrenhaus allocate as much memory as the stream's
-  header asks for (up to 4 GiB). Uploads come from the local Nix, which
-  asks for little.
 
 What Nix remembers
 
@@ -211,10 +231,12 @@ The shared server
   again. The same holds for a NAR's reference that was deleted while its
   narinfo remained: Nix gets the narinfo, then no NAR, and builds the path
   or looks elsewhere.
-- What is downloaded is checked against its hashes, and each NAR is
-  rebuilt and compared once before it is first served. What lies in the
-  local cache is not checked again on every read: a cached file damaged on
-  disk later is served as it is, and Nix rejects the NAR by its hash.
+- What is downloaded is checked against its hashes, each NAR is rebuilt
+  and compared once before it is first served, and every object read from
+  the local cache is checked against its key again. A cached file damaged
+  on disk is so found out and not served: a narinfo is answered "not here",
+  a NAR that was being sent is cut short, the pack is dropped from the
+  cache, and the next request fetches it again.
 - Anyone who knows the server's endpoint ID can read, replace and delete
   any reference. The prefix is a name, not a boundary. A narinfo is trusted
   to state its NAR's size truthfully.
@@ -233,6 +255,12 @@ What it does not do
   (`narinfo-compression=...`, Nix 2.32 and later) is refused too (415).
 - Store directories other than `/nix/store`, and NARs that are not in the
   canonical form every current Nix writes.
+- A narinfo whose content address (`CA`) Nix 2.35 refuses, or fails over
+  when it checks the path, is refused at upload (400). Content addresses
+  with `git:` hashing or BLAKE3 are taken, although a Nix without the
+  experimental features `git-hashing` and `blake3-hashes` refuses the
+  whole narinfo: such a path is of use only to colleagues who have the
+  feature on.
 - A narrenhaus that is in the Nix configuration and is not running fails
   Nix operations unless `fallback = true` is set, which is why the setup
   asks for it.
@@ -271,11 +299,18 @@ nix develop --option allow-unsafe-native-code-during-evaluation true
 - The tests in `e2e/nix_test.go` run the real `nix` against two narrenhaus
   instances and skip where there is no `nix` on `PATH`. They add small
   generated paths, one of 17 MiB, to the machine's Nix store with
-  `nix store add` and delete them again where the store allows it; they
-  change no Nix configuration. One of them shows what `fallback = true` is
-  for: it builds three derivations of one line with a stopped narrenhaus as
-  the substituter, through the machine's Nix daemon, and skips where the
-  daemon does not trust the user and so does not ask that substituter.
+  `nix store add`, and one of them three derivations and what they build,
+  and delete them again where the store allows it; they change no Nix
+  configuration. That one shows what `fallback = true` is for: it builds a
+  one-line derivation with a narrenhaus as the only substituter while that
+  runs, stops it, and then requires that a second such build fails without
+  fallback and a third succeeds with it. The builds go through the
+  machine's Nix daemon, and the test skips where the daemon does not trust
+  the user and so does not ask that substituter.
+- Two tests in other packages ask the `nix` on `PATH` and add nothing to
+  the store: one in `narinfo` asks which content addresses Nix reads, from
+  a cache of files in a temporary directory, and skips on a Nix before
+  2.31; one in `nixconf` asks which configuration it reads.
 - jaccard-store is required at a released version only.
 
 Packages, all at the top level:
