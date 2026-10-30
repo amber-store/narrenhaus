@@ -1341,7 +1341,17 @@ The two numbers of pushes are at least 1; `serve` refuses a lower one. They
 are narrenhaus's limits. The server has one of its own, jaccard-stored's
 `--verify-jobs`, which also bounds the commits on a server that does not
 verify: it caps the pushes that finish at once, so a higher number here
-helps only as far as the server lets it.
+helps only as far as the server lets it. The server also takes no more
+than 100 requests at once on the one connection narrenhaus keeps to it
+(section 9.3), and a push holds one of them while the server commits it.
+When pushes and lookups together come near 100, an upload's check that
+the server can be reached fails after its ten seconds (502, which Nix
+repeats), and a lookup waits its three seconds and goes to a fresh
+connection. The defaults stay below that for one `nix copy` (64 content
+pushes and as many narinfo pushes as Nix has uploads in flight, 25 at
+most); a second copy at the same time, or higher numbers against a
+server that is slow to commit, can reach it. Nothing in the program
+bounds the sum.
 
 Keys, created with mode 0600 when missing: `client.key`, in the format of
 jaccard-store's `node.LoadOrCreateKey`; `signing.key`, a Nix secret key
@@ -1403,7 +1413,9 @@ without waiting for requests or work, however the process was started.
   the uncompressed size of what it copies, on top of the cache limit and of
   the compressed packs being built, one for each content push that runs,
   64 at once by default. It drains as pushes finish. A full disk fails the
-  copy with 507.
+  copy with 507. A content push also holds about 18 MiB of memory while
+  its pack is built, up to about 1.2 GiB for 64 at once; a lower
+  `--content-pushes` lowers both.
 - **narrenhaus does not repair.** A reference found broken stays, and the
   path is not substitutable from narrenhaus, until someone deletes the
   reference (`jaccard-store rm`) and uploads again. The same holds for a

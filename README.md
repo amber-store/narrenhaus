@@ -93,6 +93,13 @@ and `~/Library/Caches` on macOS; the configuration directory is `~/.config`
   jaccard-stored's `--verify-jobs`, which also bounds the commits on a
   server that does not verify, caps the pushes that finish at once. Raising
   narrenhaus's limits helps only as far as the server lets it.
+- The server also takes no more than 100 requests at once on the one
+  connection narrenhaus keeps to it, and a push holds one of them while
+  the server commits it. When pushes and lookups together come near 100,
+  as with a second copy running or with limits raised beyond the defaults
+  against a server that is slow to commit, a NAR upload can be answered
+  502 after ten seconds (Nix sends it again) and a lookup can wait three
+  seconds and move to a new connection. Lower limits avoid it.
 - With a `--listen` address that is not loopback, anyone who can reach the
   port can upload into the shared prefix and get narinfos signed with this
   machine's key. The advice warns about it.
@@ -195,6 +202,9 @@ Disk and time
   later sends every NAR of a copy before the first narinfo, faster than
   they can be pushed, so a copy needs room for the uncompressed size of
   what it copies. A full disk fails the copy (507).
+- A content push holds about 18 MiB of memory while its pack is built, so
+  64 at once can hold up to about 1.2 GiB. A lower `--content-pushes`
+  lowers it.
 - A narinfo upload that waits longer than Nix's 300 seconds shows as
   repeated requests, and beyond about 25 minutes as a failed copy. The push
   goes on in narrenhaus regardless, and a repeated copy joins it. On a

@@ -180,6 +180,8 @@ Work in `../narrenhaus`. Part B starts only after `v0.8.0` of jaccard-store reso
       CacheSize uint64             // parsed by parseSize: "10GiB", "500MiB", "1073741824"; zero is an error
       ConfigDir string
       Priority  int
+      ContentPushes int              // --content-pushes, at least 1, default 64
+      NarinfoPushes int              // --narinfo-pushes, at least 1, default 64
   }
   func parseSize(s string) (uint64, error)
   ```
@@ -658,8 +660,8 @@ Work in `../narrenhaus`. Part B starts only after `v0.8.0` of jaccard-store reso
   func (e *Error) Error() string
 
   type Options struct {
-      ContentPushes int     // 0 means 4
-      NarinfoPushes int     // 0 means 8
+      ContentPushes int     // 0 means 64
+      NarinfoPushes int     // 0 means 64
       MinDedup      float64 // 0 means 0.5
       IdleExpiry    time.Duration // 0 means 15 minutes
       Log           *slog.Logger
