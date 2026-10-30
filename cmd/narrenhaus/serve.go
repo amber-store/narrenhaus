@@ -168,7 +168,12 @@ func serve(ctx context.Context, opts options, stderr io.Writer, h host) error {
 	work, stopWork := context.WithCancel(context.Background())
 	rem := remote.New(remote.Config{Dial: h.connect(clientKey, opts.Server, log), Log: log})
 	store := refs.New(work, cache, rem, refs.Options{Prefix: opts.Prefix, Log: log})
-	up := upload.New(work, cache, rem, store, upload.Options{IdleExpiry: h.idleExpiry, Log: log})
+	up := upload.New(work, cache, rem, store, upload.Options{
+		ContentPushes: opts.ContentPushes,
+		NarinfoPushes: opts.NarinfoPushes,
+		IdleExpiry:    h.idleExpiry,
+		Log:           log,
+	})
 	var sweeper sync.WaitGroup
 	sweeper.Go(func() {
 		tick := time.NewTicker(h.sweepEvery)

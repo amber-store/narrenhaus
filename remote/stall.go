@@ -13,6 +13,10 @@ import (
 // go without moving a byte. It is a variable so that tests can shorten it.
 var stallLimit = 30 * time.Second
 
+// idleConns is how many connections to the bucket the default HTTP client
+// keeps between requests.
+const idleConns = 128
+
 // stalled is the failure of a transfer that moved no byte for the limit.
 type stalled struct{ limit time.Duration }
 
@@ -32,8 +36,14 @@ func newHTTPClient(limit time.Duration) *http.Client {
 	} else {
 		base = &http.Transport{Proxy: http.ProxyFromEnvironment}
 	}
-	// Packs come from one host, several at a time.
-	base.MaxIdleConnsPerHost = 16
+	// Packs come from one host and go to it, many at a time: by the
+	// command's defaults the pushes alone are up to 128 at once, 64 of
+	// content and 64 of narinfos. With fewer connections kept than
+	// transfers run, most would be closed after one request and opened
+	// again for the next. The limit for all hosts is 100 unless it is
+	// raised as well.
+	base.MaxIdleConns = idleConns
+	base.MaxIdleConnsPerHost = idleConns
 	return &http.Client{Transport: &stallTransport{base: base, limit: limit}}
 }
 

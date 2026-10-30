@@ -1,7 +1,7 @@
 // Command narrenhaus is a Nix binary cache that runs on the machine it
 // serves and keeps what it is given on a jaccard-store server.
 //
-//	narrenhaus serve --server ENDPOINT_ID --prefix PREFIX [--listen ADDRESS] [--cache-dir DIR] [--cache-size SIZE] [--config-dir DIR] [--priority N]
+//	narrenhaus serve --server ENDPOINT_ID --prefix PREFIX [--listen ADDRESS] [--cache-dir DIR] [--cache-size SIZE] [--config-dir DIR] [--priority N] [--content-pushes N] [--narinfo-pushes N]
 //	narrenhaus check [--listen ADDRESS] [--config-dir DIR]
 //
 // Every option is a flag and a NARRENHAUS_… environment variable; the flag
@@ -76,13 +76,19 @@ type options struct {
 	ConfigDir string
 	// Priority is the Priority of nix-cache-info.
 	Priority int
+	// ContentPushes and NarinfoPushes are how many pushes of each kind run
+	// at once, never fewer than one.
+	ContentPushes int
+	NarinfoPushes int
 }
 
 // Defaults of the options that have one.
 const (
-	defaultListen    = "127.0.0.1:8484"
-	defaultCacheSize = "10GiB"
-	defaultPriority  = 50
+	defaultListen        = "127.0.0.1:8484"
+	defaultCacheSize     = "10GiB"
+	defaultPriority      = 50
+	defaultContentPushes = 64
+	defaultNarinfoPushes = 64
 )
 
 // userDir returns narrenhaus's directory under one of the user's base
@@ -114,6 +120,10 @@ func optionFlags() []cli.Flag {
 			Usage: "`DIR`ectory of the client's key and the signing key, created when missing"},
 		&cli.IntFlag{Name: "priority", EnvVars: []string{"NARRENHAUS_PRIORITY"}, Value: defaultPriority,
 			Usage: "Priority in nix-cache-info: Nix asks the substituter with the lower `NUMBER` first"},
+		&cli.IntFlag{Name: "content-pushes", EnvVars: []string{"NARRENHAUS_CONTENT_PUSHES"}, Value: defaultContentPushes,
+			Usage: "`NUMBER` of NARs whose content is pushed to the server at once"},
+		&cli.IntFlag{Name: "narinfo-pushes", EnvVars: []string{"NARRENHAUS_NARINFO_PUSHES"}, Value: defaultNarinfoPushes,
+			Usage: "`NUMBER` of narinfos that are pushed to the server at once"},
 	}
 }
 
@@ -193,7 +203,23 @@ func loadOptions(c *cli.Context) (options, error) {
 		return options{}, fmt.Errorf("--cache-size %q: %w", size, err)
 	}
 	opts.Priority = c.Int("priority")
+	if opts.ContentPushes, err = atOnce(c, "content-pushes"); err != nil {
+		return options{}, err
+	}
+	if opts.NarinfoPushes, err = atOnce(c, "narinfo-pushes"); err != nil {
+		return options{}, err
+	}
 	return opts, nil
+}
+
+// atOnce reads the option name, which says how many pushes run at once:
+// one at least.
+func atOnce(c *cli.Context, name string) (int, error) {
+	n := c.Int(name)
+	if n < 1 {
+		return 0, fmt.Errorf("--%s %d: the number of pushes at once must be at least 1", name, n)
+	}
+	return n, nil
 }
 
 // loadCheckOptions reads and checks the options check needs: the address

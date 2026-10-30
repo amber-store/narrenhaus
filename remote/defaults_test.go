@@ -1,6 +1,7 @@
 package remote
 
 import (
+	"net/http"
 	"testing"
 	"time"
 )
@@ -29,6 +30,16 @@ func TestDefaultLimits(t *testing.T) {
 	}
 	if stall.limit != 30*time.Second {
 		t.Errorf("a bucket transfer may stall for %v by default, want 30s", stall.limit)
+	}
+	// Connections to the bucket are kept for as many transfers as the
+	// pushes of both kinds make at once by default, 64 and 64.
+	base, ok := stall.base.(*http.Transport)
+	if !ok {
+		t.Fatalf("the transport under the stall limit is a %T, want an *http.Transport", stall.base)
+	}
+	if base.MaxIdleConnsPerHost != 128 || base.MaxIdleConns != 128 {
+		t.Errorf("%d idle connections are kept to a host and %d in all, want 128 and 128",
+			base.MaxIdleConnsPerHost, base.MaxIdleConns)
 	}
 }
 

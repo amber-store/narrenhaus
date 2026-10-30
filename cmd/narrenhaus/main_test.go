@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -54,6 +55,8 @@ var optionVariables = []string{
 	"NARRENHAUS_CACHE_SIZE",
 	"NARRENHAUS_CONFIG_DIR",
 	"NARRENHAUS_PRIORITY",
+	"NARRENHAUS_CONTENT_PUSHES",
+	"NARRENHAUS_NARINFO_PUSHES",
 }
 
 // clearEnvironment takes the options' variables out of the environment for
@@ -168,6 +171,9 @@ func TestLoadOptionsDefaults(t *testing.T) {
 	if opts.Priority != 50 {
 		t.Errorf("Priority = %d, want 50", opts.Priority)
 	}
+	if opts.ContentPushes != 64 || opts.NarinfoPushes != 64 {
+		t.Errorf("ContentPushes, NarinfoPushes = %d, %d, want 64, 64", opts.ContentPushes, opts.NarinfoPushes)
+	}
 	cache, err := os.UserCacheDir()
 	if err != nil {
 		t.Fatal(err)
@@ -194,18 +200,22 @@ func TestLoadOptionsFromFlags(t *testing.T) {
 		"--cache-size", "500MiB",
 		"--config-dir", "/etc/nh",
 		"--priority", "30",
+		"--content-pushes", "3",
+		"--narinfo-pushes", "5",
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := options{
-		Server:    opts.Server,
-		Prefix:    "acme/",
-		Listen:    "[::1]:9000",
-		CacheDir:  "/var/cache/nh",
-		CacheSize: 500 << 20,
-		ConfigDir: "/etc/nh",
-		Priority:  30,
+		Server:        opts.Server,
+		Prefix:        "acme/",
+		Listen:        "[::1]:9000",
+		CacheDir:      "/var/cache/nh",
+		CacheSize:     500 << 20,
+		ConfigDir:     "/etc/nh",
+		Priority:      30,
+		ContentPushes: 3,
+		NarinfoPushes: 5,
 	}
 	if opts != want {
 		t.Errorf("options = %+v, want %+v", opts, want)
@@ -224,18 +234,22 @@ func TestLoadOptionsFromEnvironment(t *testing.T) {
 	t.Setenv("NARRENHAUS_CACHE_SIZE", "2GiB")
 	t.Setenv("NARRENHAUS_CONFIG_DIR", "/etc/nh")
 	t.Setenv("NARRENHAUS_PRIORITY", "45")
+	t.Setenv("NARRENHAUS_CONTENT_PUSHES", "6")
+	t.Setenv("NARRENHAUS_NARINFO_PUSHES", "9")
 	opts, err := load(t)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := options{
-		Server:    opts.Server,
-		Prefix:    "acme/",
-		Listen:    "127.0.0.1:9001",
-		CacheDir:  "/var/cache/nh",
-		CacheSize: 2 << 30,
-		ConfigDir: "/etc/nh",
-		Priority:  45,
+		Server:        opts.Server,
+		Prefix:        "acme/",
+		Listen:        "127.0.0.1:9001",
+		CacheDir:      "/var/cache/nh",
+		CacheSize:     2 << 30,
+		ConfigDir:     "/etc/nh",
+		Priority:      45,
+		ContentPushes: 6,
+		NarinfoPushes: 9,
 	}
 	if opts != want {
 		t.Errorf("options = %+v, want %+v", opts, want)
@@ -245,12 +259,15 @@ func TestLoadOptionsFromEnvironment(t *testing.T) {
 	}
 
 	// The flag wins over the variable.
-	opts, err = load(t, "--prefix", "other/", "--priority", "7")
+	opts, err = load(t, "--prefix", "other/", "--priority", "7", "--content-pushes", "2", "--narinfo-pushes", "1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if opts.Prefix != "other/" || opts.Priority != 7 {
 		t.Errorf("Prefix, Priority = %q, %d, want %q, 7", opts.Prefix, opts.Priority, "other/")
+	}
+	if opts.ContentPushes != 2 || opts.NarinfoPushes != 1 {
+		t.Errorf("ContentPushes, NarinfoPushes = %d, %d, want 2, 1", opts.ContentPushes, opts.NarinfoPushes)
 	}
 }
 
@@ -360,6 +377,10 @@ func TestLoadOptionsRefusesOtherBadOptions(t *testing.T) {
 		{"--listen", []string{"--listen", "127.0.0.1:-1"}},
 		{"--cache-dir", []string{"--cache-dir", ""}},
 		{"--config-dir", []string{"--config-dir", ""}},
+		{"--content-pushes", []string{"--content-pushes", "0"}},
+		{"--content-pushes", []string{"--content-pushes", "-1"}},
+		{"--narinfo-pushes", []string{"--narinfo-pushes", "0"}},
+		{"--narinfo-pushes", []string{"--narinfo-pushes", "-8"}},
 	} {
 		args := append([]string{"--server", testServer, "--prefix", "acme/"}, tc.args...)
 		_, err := load(t, args...)
@@ -406,7 +427,8 @@ func TestServeHelpListsTheOptions(t *testing.T) {
 	}
 	for _, want := range append([]string{
 		"--server", "--prefix", "--listen", "--cache-dir", "--cache-size", "--config-dir", "--priority",
-		"127.0.0.1:8484", "10GiB", "50",
+		"--content-pushes", "--narinfo-pushes",
+		"127.0.0.1:8484", "10GiB", "50", "64",
 	}, optionVariables...) {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("help of serve does not mention %q:\n%s", want, stdout)
@@ -619,6 +641,8 @@ func TestServeRefusesBadOptions(t *testing.T) {
 		{"--cache-size", []string{"--cache-size", "lots"}},
 		{"--listen", []string{"--listen", busy.Addr().String()}},
 		{"--listen", []string{"--listen", "nowhere"}},
+		{"--content-pushes", []string{"--content-pushes", "0"}},
+		{"--narinfo-pushes", []string{"--narinfo-pushes", "-2"}},
 	} {
 		dir := t.TempDir()
 		msg := refused(tc.name, serveArgs(dir, tc.args...)...)
@@ -712,7 +736,8 @@ func TestCheckNeedsNoServer(t *testing.T) {
 
 	// The options of serve are taken and not looked at.
 	other, _, err := run(t, "check", "--listen", "127.0.0.1:1", "--config-dir", dir,
-		"--server", "nonsense", "--prefix", "a@b/", "--cache-size", "0", "--cache-dir", "")
+		"--server", "nonsense", "--prefix", "a@b/", "--cache-size", "0", "--cache-dir", "",
+		"--content-pushes", "0", "--narinfo-pushes", "-1")
 	if err != nil || other != stdout {
 		t.Errorf("check with options of serve that are wrong: %v\n%s", err, other)
 	}
@@ -1017,13 +1042,15 @@ func testOptions(t *testing.T, dir string) options {
 		t.Fatal(err)
 	}
 	return options{
-		Server:    id,
-		Prefix:    "acme/",
-		Listen:    "127.0.0.1:0",
-		CacheDir:  filepath.Join(dir, "cache"),
-		CacheSize: 1 << 30,
-		ConfigDir: filepath.Join(dir, "config"),
-		Priority:  30,
+		Server:        id,
+		Prefix:        "acme/",
+		Listen:        "127.0.0.1:0",
+		CacheDir:      filepath.Join(dir, "cache"),
+		CacheSize:     1 << 30,
+		ConfigDir:     filepath.Join(dir, "config"),
+		Priority:      30,
+		ContentPushes: 64,
+		NarinfoPushes: 64,
 	}
 }
 
@@ -1210,6 +1237,100 @@ func TestUploadToOneServeFetchFromTheOther(t *testing.T) {
 	}
 	if a.logged("NAR served") != 0 || b.logged("NAR served") != 1 {
 		t.Errorf("the logs do not say that b served one NAR and a none:\n%s\n%s", a.log.String(), b.log.String())
+	}
+}
+
+// heldUploads makes the server's bucket keep every upload waiting until
+// release is called. packs says how many packs have had an upload arrive
+// there since: a push uploads one pack, its index and its data.
+func heldUploads(t *testing.T, srv *testserver.Server) (packs func() int, release func()) {
+	t.Helper()
+	var (
+		mu   sync.Mutex
+		seen = map[string]bool{}
+	)
+	gate := make(chan struct{})
+	srv.Intercept(func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method != http.MethodPut {
+			return false
+		}
+		mu.Lock()
+		seen[path.Dir(r.URL.Path)] = true
+		mu.Unlock()
+		select {
+		case <-gate:
+		case <-r.Context().Done():
+		}
+		return false
+	})
+	release = sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release)
+	return func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(seen)
+	}, release
+}
+
+// serve runs as many pushes at once as --content-pushes and
+// --narinfo-pushes say: while the bucket ends no upload, that many packs
+// of each kind are on their way to it, and the pushes beyond them wait.
+func TestServeRunsAsManyPushesAtOnceAsItsOptionsSay(t *testing.T) {
+	clearEnvironment(t)
+	noNix(t)
+	srv := testserver.Start(t, testserver.Options{})
+	// The options are read from a command line, so the two numbers go the
+	// whole way from their flags to the bucket.
+	opts, err := load(t, serveArgs(t.TempDir(), "--content-pushes", "1", "--narinfo-pushes", "2")[1:]...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := startServe(t, opts, hostOf(srv, time.Second))
+	paths := []testPath{
+		newTestPath(t, "the first of three paths\n"),
+		newTestPath(t, "the second of three paths\n"),
+		newTestPath(t, "the third of three paths\n"),
+	}
+	// Pushes that are let run reach the bucket in less than this; one that
+	// has not come by then is kept waiting.
+	const others = 300 * time.Millisecond
+
+	// A NAR is answered once it is staged, and its push goes on.
+	packs, release := heldUploads(t, srv)
+	for _, p := range paths {
+		d.want(http.StatusOK, http.MethodPut, "/nar/"+p.narHash+".nar", p.archive)
+	}
+	eventually(t, "a content push reaches the bucket", func() bool { return packs() >= 1 })
+	time.Sleep(others)
+	if n := packs(); n != 1 {
+		t.Fatalf("%d content pushes run at once with --content-pushes 1", n)
+	}
+	release()
+	eventually(t, "every content is pushed", func() bool { return d.logged("content pushed") == len(paths) })
+
+	// A narinfo is answered once it is pushed.
+	packs, release = heldUploads(t, srv)
+	type answer struct {
+		status int
+		err    error
+	}
+	answered := make(chan answer, len(paths))
+	for _, p := range paths {
+		go func() {
+			status, _, err := d.do(http.MethodPut, "/"+p.hash+".narinfo", bytes.NewReader(p.narinfo))
+			answered <- answer{status, err}
+		}()
+	}
+	eventually(t, "two narinfo pushes reach the bucket", func() bool { return packs() >= 2 })
+	time.Sleep(others)
+	if n := packs(); n != 2 {
+		t.Fatalf("%d narinfo pushes run at once with --narinfo-pushes 2", n)
+	}
+	release()
+	for range paths {
+		if a := <-answered; a.err != nil || a.status != http.StatusOK {
+			t.Errorf("PUT of a narinfo: status %d, %v, want 200\n%s", a.status, a.err, d.log.String())
+		}
 	}
 }
 

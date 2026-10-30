@@ -2262,15 +2262,16 @@ func TestANARThatIsTooLarge(t *testing.T) {
 }
 
 func TestDefaults(t *testing.T) {
-	// The limits the design fixes (spec 5 and 5.1). The command passes
-	// none of its own, so these are the ones it runs with.
+	// The limits the design fixes (spec 5 and 5.1). The two numbers of
+	// pushes the command passes from its options, whose defaults are the
+	// same two (spec 10); the others are the ones it runs with.
 	u := New(context.Background(), nil, nil, nil, Options{})
 	defer u.Close()
-	if u.contentPushes != 4 {
-		t.Errorf("%d content pushes at once, want 4", u.contentPushes)
+	if u.contentPushes != 64 {
+		t.Errorf("%d content pushes at once, want 64", u.contentPushes)
 	}
-	if n := cap(u.narinfoPlaces); n != 8 {
-		t.Errorf("%d narinfo pushes at once, want 8", n)
+	if n := cap(u.narinfoPlaces); n != 64 {
+		t.Errorf("%d narinfo pushes at once, want 64", n)
 	}
 	if u.minDedup != 0.5 {
 		t.Errorf("MinDedup is %v, want 0.5", u.minDedup)
