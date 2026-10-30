@@ -18,8 +18,9 @@
 // found to have the content after all). A finished push leaves no entry:
 // from then on the server says what there is.
 //
-// A few content pushes run at once and the rest wait, those a narinfo has
-// asked for before the others. Narinfo pushes have places of their own.
+// As many content pushes run at once as the options say, and the rest wait,
+// those a narinfo has asked for before the others. Narinfo pushes have
+// places of their own.
 package upload
 
 import (
@@ -44,8 +45,8 @@ import (
 )
 
 const (
-	defaultContentPushes = 4
-	defaultNarinfoPushes = 8
+	defaultContentPushes = 64
+	defaultNarinfoPushes = 64
 	defaultMinDedup      = 0.5
 	defaultIdleExpiry    = 15 * time.Minute
 
@@ -102,8 +103,8 @@ func oneLine(s string) string {
 
 // Options configure an Uploader.
 type Options struct {
-	ContentPushes int           // 0 means 4
-	NarinfoPushes int           // 0 means 8
+	ContentPushes int           // 0 means 64
+	NarinfoPushes int           // 0 means 64
 	MinDedup      float64       // 0 means 0.5
 	IdleExpiry    time.Duration // 0 means 15 minutes
 	Log           *slog.Logger

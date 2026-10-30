@@ -90,6 +90,13 @@ request; section 2.3, entry 26, has the decision and its reason.*
 - **jaccard-store's additions are made, merged and released by the
   builder** (pull request, merge, release), and **narrenhaus never
   references an unreleased jaccard-store** (section 9.4).
+- **How many pushes run at once is an option, 64 by default**, for content
+  pushes and for narinfo pushes each: `--content-pushes` and
+  `--narinfo-pushes` (sections 5 and 10). Decided on 2026-10-30, after a
+  copy of a closure of thousands of paths was measured: the four content
+  pushes and eight narinfo pushes at once that the builder had fixed
+  (section 2.3, entry 15) were too low once the server's own limit had
+  been lifted.
 
 ### 2.2 Made in design, accepted by the owner in conversation
 
@@ -201,8 +208,9 @@ check costs. The owner has not yet confirmed any of entries 23 to 45.
     300-second limit (section 6.4).
 15. Defaults: listen `127.0.0.1:8484`, cache size 10 GiB, priority 50,
     parent rule as jaccard-store's CLI (at least half the bytes shared);
-    at once, four content pushes, eight narinfo pushes, eight content
-    downloads and sixteen narinfo downloads.
+    at once, eight content downloads and sixteen narinfo downloads. The
+    pushes at once, which this entry had at four of content and eight of
+    narinfos, are the owner's decision since 2026-10-30 (section 2.1).
 16. The signing key's name is `narrenhaus-<first 8 hex digits of its public
     key>`. Nix keeps one key per name, so one name for every laptop would
     break as soon as two keys met in one configuration.
@@ -539,13 +547,14 @@ last error), or has failed for good (with the reason, until the next NAR
 content reference on the server). A finished push leaves no entry: from
 then on narrenhaus goes by what the server says.
 
-**Order.** At most four content pushes run at once; the rest queue. Queued
-content work that a narinfo `PUT` has asked for, at any time in this
-process, runs before work no narinfo has asked for, each kind in the order
-it was first asked or arrived. Without this, Nix 2.35's order (largest NARs
-first, narinfos of leaf paths first) would leave each narinfo waiting
-behind the whole closure. Narinfo pushes have their own limit of eight and
-never wait behind content pushes.
+**Order.** At most 64 content pushes run at once, or as many as the option
+`--content-pushes` says (section 10); the rest queue. Queued content work
+that a narinfo `PUT` has asked for, at any time in this process, runs
+before work no narinfo has asked for, each kind in the order it was first
+asked or arrived. Without this, Nix 2.35's order (largest NARs first,
+narinfos of leaf paths first) would leave each narinfo waiting behind the
+whole closure. Narinfo pushes have their own limit, 64 as well or what the
+option `--narinfo-pushes` says, and never wait behind content pushes.
 
 **Failure.** A push has failed for good when the server answers
 `bad_request` or `malformed_pack` (for example a pack over the server's
@@ -1323,8 +1332,16 @@ has a flag and an environment variable.
 | `--cache-size` | `NARRENHAUS_CACHE_SIZE` | `10GiB` | limit of section 7.3 |
 | `--config-dir` | `NARRENHAUS_CONFIG_DIR` | `<UserConfigDir>/narrenhaus` | the two keys |
 | `--priority` | `NARRENHAUS_PRIORITY` | `50` | `Priority` in `nix-cache-info` |
+| `--content-pushes` | `NARRENHAUS_CONTENT_PUSHES` | `64` | content pushes at once (section 5) |
+| `--narinfo-pushes` | `NARRENHAUS_NARINFO_PUSHES` | `64` | narinfo pushes at once (section 5) |
 
 `check` needs only `--listen` and `--config-dir`.
+
+The two numbers of pushes are at least 1; `serve` refuses a lower one. They
+are narrenhaus's limits. The server has one of its own, jaccard-stored's
+`--verify-jobs`, which also bounds the commits on a server that does not
+verify: it caps the pushes that finish at once, so a higher number here
+helps only as far as the server lets it.
 
 Keys, created with mode 0600 when missing: `client.key`, in the format of
 jaccard-store's `node.LoadOrCreateKey`; `signing.key`, a Nix secret key
@@ -1384,8 +1401,9 @@ without waiting for requests or work, however the process was started.
   2.35 and later a `nix copy` sends all NARs before the first narinfo, and
   they arrive faster than they can be pushed, so a copy needs free disk for
   the uncompressed size of what it copies, on top of the cache limit and of
-  up to four compressed packs being built. It drains as pushes finish. A
-  full disk fails the copy with 507.
+  the compressed packs being built, one for each content push that runs,
+  64 at once by default. It drains as pushes finish. A full disk fails the
+  copy with 507.
 - **narrenhaus does not repair.** A reference found broken stays, and the
   path is not substitutable from narrenhaus, until someone deletes the
   reference (`jaccard-store rm`) and uploads again. The same holds for a
@@ -1605,7 +1623,9 @@ without waiting for requests or work, however the process was started.
   job. The wait for a reference; staged NARs nobody came back for; the
   cache kept under its size; a narinfo `PUT` after a restart; and the
   command's own dial, to a server at a given address, under the identity
-  of its key file.
+  of its key file. The two numbers of pushes at once, read from a command
+  line: while the bucket ends no upload, as many pushes of each kind have
+  reached it as the option says, and no more.
 - **With real Nix**, where the `nix` program is present: `nix copy --to` a
   closure of several paths with references between them into one instance
   and substitute it from another into a throwaway store; with the default

@@ -67,6 +67,8 @@ follow the command: `narrenhaus serve --server ...`.
 | `--cache-size` | `NARRENHAUS_CACHE_SIZE` | `10GiB` | size the pack cache is kept under: bytes, or a number with `KiB`, `MiB`, `GiB` or `TiB` |
 | `--config-dir` | `NARRENHAUS_CONFIG_DIR` | `narrenhaus` under the user's configuration directory | the two keys |
 | `--priority` | `NARRENHAUS_PRIORITY` | `50` | `Priority` in `nix-cache-info`; Nix asks the cache with the lower number first, and cache.nixos.org has 40 |
+| `--content-pushes` | `NARRENHAUS_CONTENT_PUSHES` | `64` | how many NARs have their content pushed to the server at once; the others wait their turn |
+| `--narinfo-pushes` | `NARRENHAUS_NARINFO_PUSHES` | `64` | how many narinfos are pushed to the server at once |
 
 The user's cache directory is `~/.cache` on Linux (or `$XDG_CACHE_HOME`)
 and `~/Library/Caches` on macOS; the configuration directory is `~/.config`
@@ -86,6 +88,11 @@ and `~/Library/Caches` on macOS; the configuration directory is `~/.config`
 - Nix remembers a cache's `nix-cache-info` for seven days, so a changed
   `--priority` takes effect after that, or at once with `?priority=N` on the
   substituter URL.
+- `--content-pushes` and `--narinfo-pushes` are at least 1. They bound
+  what narrenhaus does at once, and the server has a limit of its own:
+  jaccard-stored's `--verify-jobs`, which also bounds the commits on a
+  server that does not verify, caps the pushes that finish at once. Raising
+  narrenhaus's limits helps only as far as the server lets it.
 - With a `--listen` address that is not loopback, anyone who can reach the
   port can upload into the shared prefix and get narinfos signed with this
   machine's key. The advice warns about it.
